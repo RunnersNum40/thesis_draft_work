@@ -67,12 +67,8 @@ def step_cpg(state: CPGState, params: CPGParams, dt: float) -> CPGState:
 
 
 if __name__ == "__main__":
-    import matplotlib.pyplot as plt
-    import seaborn as sns
-    from matplotlib.animation import FuncAnimation
+    from visualization import animate_trajectory, plot_polar_trajectory, plot_trajectory
     from tqdm import tqdm
-
-    sns.set_theme(style="ticks")
 
     intrinsic_amplitude = np.array([2.0, 1.0])
     intrinsic_frequency = np.array([2.0 * np.pi, -2.0 * np.pi])
@@ -100,29 +96,12 @@ if __name__ == "__main__":
 
     dt = 1e-3
     steps = 10000
-    phases = np.zeros((steps, len(state.phase)))
-    amplitudes = np.zeros((steps, len(state.phase)))
+    states = []
 
     for i in tqdm(range(steps)):
         state = step_cpg(state, params, dt)
-        phases[i] = state.phase
-        amplitudes[i] = state.amplitude
+        states.append(state)
 
-    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw={"projection": "polar"})
-    lines = []
-    for i in range(len(state.phase)):
-        (line,) = ax.plot([], [], label=f"Oscillator {i+1}")
-        lines.append(line)
-
-    ax.set_rmax(3.5)
-    ax.set_title("CPG Oscillator Phase and Amplitude Over Time")
-    ax.legend()
-
-    def update(frame):
-        for i in range(len(state.phase)):
-            lines[i].set_data(phases[:frame, i], amplitudes[:frame, i])
-        return lines
-
-    ani = FuncAnimation(fig, update, frames=steps, blit=True, interval=0.1)
-
-    plt.show()
+    plot_trajectory(states, dt)
+    plot_polar_trajectory(states)
+    animate_trajectory(states)
