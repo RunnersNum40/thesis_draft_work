@@ -95,7 +95,7 @@ if __name__ == "__main__":
     )
 
     dt = 1e-3
-    steps = 10000
+    steps = 1000
     states = []
 
     for i in tqdm(range(steps)):

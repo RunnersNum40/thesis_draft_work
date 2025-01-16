@@ -1,18 +1,37 @@
 import gymnasium as gym
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.monitor import Monitor
 
 import cpg_env
 from visualization import animate_trajectory, plot_polar_trajectory, plot_trajectory
 
-EPISODE_STEPS = 100
-NUM_EPISODES = 100
+NUM_ENVS = 6
+EPISODE_STEPS = 1000
+NUM_EPISODES = 500
 TIMESTEPS = EPISODE_STEPS * NUM_EPISODES
 
-env = gym.make("SquareCPGEnv-v0", max_episode_steps=EPISODE_STEPS, n=1)
+
+def make_env(env_id: str, *args, **kwargs):
+    def _init():
+        env = gym.make(env_id, *args, **kwargs)
+        env = Monitor(env)
+        return env
+
+    return _init
+
+
+env_fns = [
+    make_env("SquareCPGEnv-v0", max_episode_steps=EPISODE_STEPS, n=1)
+    for i in range(NUM_ENVS)
+]
+
+vec_env = SubprocVecEnv(env_fns, start_method="fork")
+
 
 model = PPO(
     policy="MlpPolicy",
-    env=env,
+    env=vec_env,
     verbose=1,
     tensorboard_log="runs/",
 )
@@ -42,4 +61,5 @@ def visualize_run(env, model, steps=1000):
     animate_trajectory(states_and_params)
 
 
+env = gym.make("SquareCPGEnv-v0", n=1)
 visualize_run(env, model, EPISODE_STEPS)
