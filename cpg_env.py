@@ -4,19 +4,20 @@ import gymnasium as gym
 from cpg import CPGParams, CPGState, step_cpg
 
 
-def action_to_params(action: np.ndarray) -> CPGParams:
+def action_to_params(
+    action: np.ndarray, convergence_factor: float = 100.0
+) -> CPGParams:
     n = action.shape[1]
 
     intrinsic_amplitude = action[0]
     intrinsic_frequency = action[1]
-    convergence_factor = np.repeat(100.0, n)
     coupling_strength = np.zeros((n, n))
     phase_bias = np.zeros((n, n))
 
     return CPGParams(
         intrinsic_amplitude=intrinsic_amplitude,
         intrinsic_frequency=intrinsic_frequency,
-        convergence_factor=convergence_factor,
+        convergence_factor=np.repeat(convergence_factor, n),
         coupling_strength=coupling_strength,
         phase_bias=phase_bias,
     )
@@ -153,11 +154,15 @@ if __name__ == "__main__":
 
     NUM_TIMESTEPS = 1000
     states = [env.unwrapped.state]
+    params = []
+
     for _ in range(NUM_TIMESTEPS):
         action = env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
         states.append(env.unwrapped.state)
+        params.append(action_to_params(action))
 
-    plot_trajectory(states, env.unwrapped.dt)
-    plot_polar_trajectory(states)
-    animate_trajectory(states)
+    states_and_params = list(zip(states, params))
+    plot_trajectory(states_and_params, env.unwrapped.dt)
+    plot_polar_trajectory(states_and_params)
+    animate_trajectory(states_and_params)

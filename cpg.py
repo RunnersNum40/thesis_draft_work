@@ -102,6 +102,7 @@ if __name__ == "__main__":
         state = step_cpg(state, params, dt)
         states.append(state)
 
-    plot_trajectory(states, dt)
-    plot_polar_trajectory(states)
-    animate_trajectory(states)
+    states_and_params = list(zip(states, [params] * len(states)))
+    plot_trajectory(states_and_params, dt)
+    plot_polar_trajectory(states_and_params)
+    animate_trajectory(states_and_params)
