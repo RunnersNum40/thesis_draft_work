@@ -5,16 +5,15 @@ from cpg import CPGParams, CPGState
 
 
 def plot_trajectory(states_and_params: list[tuple[CPGState, CPGParams]], dt: float):
-    phases = (
-        np.mod(
-            np.array([state.phase for state, params in states_and_params]) + np.pi,
-            2 * np.pi,
-        )
-        - np.pi
+    phases = np.mod(
+        np.array([state.phase for state, params in states_and_params]), np.pi
     )
     amplitudes = np.array([state.amplitude for state, params in states_and_params])
     intrinsic_amplitudes = np.array(
         [params.intrinsic_amplitude for state, params in states_and_params]
+    )
+    intrinsic_frequencies = np.array(
+        [params.intrinsic_frequency for state, params in states_and_params]
     )
 
     plt.figure(figsize=(10, 5))
@@ -25,13 +24,19 @@ def plot_trajectory(states_and_params: list[tuple[CPGState, CPGParams]], dt: flo
         plt.plot(
             np.arange(len(states_and_params)) * dt,
             amplitudes[:, i],
-            "--",
             label=f"Amplitude {i+1}",
         )
         plt.plot(
             np.arange(len(states_and_params)) * dt,
             intrinsic_amplitudes[:, i],
+            "--",
             label=f"Intrinsic Amplitude {i+1}",
+        )
+        plt.plot(
+            np.arange(len(states_and_params)) * dt,
+            intrinsic_frequencies[:, i],
+            "--",
+            label=f"Intrinsic Frequency {i+1}",
         )
 
     plt.xlabel("Time (s)")
