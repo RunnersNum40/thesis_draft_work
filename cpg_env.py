@@ -1,25 +1,24 @@
 from typing import Optional
-import numpy as np
+
 import gymnasium as gym
+import numpy as np
+
 from cpg import CPGParams, CPGState, step_cpg
+import sdf
 
 
 def action_to_params(
-    action: np.ndarray, convergence_factor: float = 100.0
+    action: np.ndarray,
+    convergence_factor: float = 100.0,
 ) -> CPGParams:
     n = action.shape[1]
 
-    intrinsic_amplitude = action[0]
-    intrinsic_frequency = action[1]
-    coupling_strength = np.zeros((n, n))
-    phase_bias = np.zeros((n, n))
-
     return CPGParams(
-        intrinsic_amplitude=intrinsic_amplitude,
-        intrinsic_frequency=intrinsic_frequency,
+        intrinsic_amplitude=action[0],
+        intrinsic_frequency=action[1],
         convergence_factor=np.repeat(convergence_factor, n),
-        coupling_strength=coupling_strength,
-        phase_bias=phase_bias,
+        coupling_strength=np.zeros((n, n)),
+        phase_bias=np.zeros((n, n)),
     )
 
 
@@ -28,63 +27,66 @@ def state_to_observation(state: CPGState) -> np.ndarray:
 
 
 class CPGEnv(gym.Env):
-    distance_weight = 1.0e-2
-    velocity_weight = 0.0
+    distance_weight = 1.0
+    velocity_weight = 1.0
 
     def __init__(
-        self, n: int, dt: float = 1e-2, observe_last_action: bool = True
+        self,
+        n: int = 1,
+        time_limit: Optional[int] = 1024,
+        dt: float = 1e-3,
+        state_noise: float = 0.0,
+        action_noise: float = 0.0,
+        observation_noise: float = 0.0,
     ) -> None:
         self.n = n
+        self.time_limit = time_limit
         self.dt = dt
-        self.observe_last_action = observe_last_action
-
-        action_space_low = np.array([np.array(0.0).repeat(n), np.array(1.0).repeat(n)])
-        action_space_high = np.array(
-            [np.array(2.0).repeat(n), np.array(10.0).repeat(n)]
-        )
-
-        if self.observe_last_action:
-            observation_space_shape = (2 + 2, n)
-        else:
-            observation_space_shape = (2, n)
+        self.state_noise = state_noise
+        self.action_noise = action_noise
+        self.observation_noise = observation_noise
 
         self.observation_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=observation_space_shape,
+            shape=(2, n),
             dtype=np.float64,
         )
 
+        action_low = np.array([0.0, np.pi / 4])
+        action_high = np.array([2.0, np.pi])
+
         self.action_space = gym.spaces.Box(
-            low=action_space_low,
-            high=action_space_high,
+            low=np.repeat([action_low], n, axis=0).T,
+            high=np.repeat([action_high], n, axis=0).T,
             shape=(2, n),
             dtype=np.float64,
         )
 
     def _get_obs(self) -> np.ndarray:
         state_observation = state_to_observation(self.state)
-        if self.observe_last_action:
-            if self.previous_action is None:
-                action_observation = np.zeros((2, self.n))
-            else:
-                action_observation = self.previous_action
 
-            return np.concatenate([state_observation, action_observation])
-
-        return state_observation
+        return state_observation + self.np_random.normal(
+            0.0, self.observation_noise, state_observation.shape
+        )
 
     def _get_reward(self) -> float:
         angular_velocity = self._angular_velocity()
         distance = self._get_distance()
 
-        return angular_velocity * self.velocity_weight - distance * self.distance_weight
+        return (
+            float(
+                angular_velocity * self.velocity_weight
+                - distance * self.distance_weight
+            )
+            * self.dt
+        )
 
     def _get_terminated(self) -> bool:
         return False
 
     def _get_truncated(self) -> bool:
-        return False
+        return self.time_limit is not None and self.step_count >= self.time_limit
 
     def _get_info(self) -> dict:
         return {}
@@ -94,29 +96,56 @@ class CPGEnv(gym.Env):
     ) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
 
-        self.previous_state: Optional[CPGState] = None
-        self.previous_action: Optional[np.ndarray] = None
+        self.step_count = 0
 
-        self.state = CPGState(
-            np.zeros(self.n),
-            np.ones(self.n),
-            np.zeros(self.n),
+        self.previous_action: np.ndarray = self.action_space.sample()
+
+        self.previous_state = CPGState(
+            self.np_random.uniform(-np.pi, np.pi, self.n),
+            self.np_random.uniform(0.0, 2.0, self.n),
+            self.np_random.uniform(-1.0, 1.0, self.n),
+        )
+        self.state = step_cpg(
+            self.previous_state, action_to_params(self.previous_action), self.dt
         )
 
         return self._get_obs(), self._get_info()
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict]:
-        params = action_to_params(action)
+        params = action_to_params(
+            action + self.np_random.normal(0.0, self.action_noise, action.shape)
+        )
+
+        self.previous_action = action
         self.previous_state = self.state
-        self.state = step_cpg(self.state, params, self.dt)
+        self.step_count += 1
+
+        self.state = step_cpg(
+            self.state, params, self.dt * self.np_random.integers(1, 21)
+        )
+
+        if self.state_noise > 0.0:
+            self.state = CPGState(
+                self.state.phase
+                + self.np_random.normal(0.0, self.state_noise, self.state.phase.shape)
+                * self.dt,
+                self.state.amplitude
+                + self.np_random.normal(
+                    0.0, self.state_noise, self.state.amplitude.shape
+                )
+                * self.dt,
+                self.state.amplitude_dot
+                + self.np_random.normal(
+                    0.0, self.state_noise, self.state.amplitude_dot.shape
+                )
+                * self.dt,
+            )
 
         obs = self._get_obs()
         reward = self._get_reward()
         terminated = self._get_terminated()
         truncated = self._get_truncated()
         info = self._get_info()
-
-        self.previous_action = action
 
         return obs, reward, terminated, truncated, info
 
@@ -126,30 +155,60 @@ class CPGEnv(gym.Env):
 
         return self.state.phase[0] - self.previous_state.phase[0] / self.dt
 
-    def _get_distance(self) -> float:
+    def _get_distance(self) -> float | np.ndarray:
         raise NotImplementedError
 
 
-def sdf_square(p, half_size):
-    q = np.abs(p) - half_size
-    return np.linalg.norm(np.maximum(q, 0)) + np.min(np.maximum(q[0], q[1]))
-
-
 class SquareCPGEnv(CPGEnv):
-    half_size = 1.0
+    distance_weight = 1.0
+    velocity_weight = 0.0
 
-    def _get_distance(self) -> float:
+    half_size = 1.0
+    shape = "square"
+
+    def _get_distance(self) -> float | np.ndarray:
         x = self.state.amplitude[0] * np.cos(self.state.phase[0])
         y = self.state.amplitude[0] * np.sin(self.state.phase[0])
-        return abs(sdf_square(np.array([x, y]), self.half_size))
+        return abs(sdf.square(np.array([x, y]), self.half_size))
 
 
-gym.register(id="SquareCPGEnv-v0", entry_point=SquareCPGEnv)
+rescale_action_spec = gym.wrappers.RescaleAction.wrapper_spec(
+    min_action=-1, max_action=1
+)
+
+gym.register(
+    id="SquareCPGEnv-v0",
+    entry_point=lambda *args, **kwargs: SquareCPGEnv(*args, **kwargs),
+    additional_wrappers=(rescale_action_spec,),
+)
+
+
+class EllipseCPGEnv(CPGEnv):
+    distance_weight = 1.0
+    velocity_weight = 0.0
+
+    a = 1.0
+    b = 0.5
+
+    shape = "ellipse"
+
+    def _get_distance(self) -> float | np.ndarray:
+        x = self.state.amplitude[0] * np.cos(self.state.phase[0])
+        y = self.state.amplitude[0] * np.sin(self.state.phase[0])
+        return abs(sdf.ellipse(np.array([x, y]), self.a, self.b))
+
+
+gym.register(
+    id="EllipseCPGEnv-v0",
+    entry_point=lambda *args, **kwargs: EllipseCPGEnv(*args, **kwargs),
+    additional_wrappers=(rescale_action_spec,),
+)
+
 
 if __name__ == "__main__":
     from visualization import animate_trajectory, plot_polar_trajectory, plot_trajectory
 
-    env = gym.make("SquareCPGEnv-v0", n=2)
+    env = gym.make("EllipseCPGEnv-v0", n=2)
     obs, _ = env.reset()
 
     NUM_TIMESTEPS = 1000
