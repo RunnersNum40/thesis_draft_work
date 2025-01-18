@@ -1,54 +1,65 @@
-import gymnasium as gym
+import logging
 
+import gymnasium as gym
 import numpy as np
+from tqdm.rich import tqdm
+
 import cpg_env
+import sdf
 from cpg import CPGState
 from visualization import animate_trajectory, plot_polar_trajectory, plot_trajectory
 
-EPISODE_STEPS = 1000
-
-env = gym.make("SquareCPGEnv-v0", max_episode_steps=EPISODE_STEPS, n=1)
+logging.basicConfig(level=logging.INFO)
 
 
 class MatchAmplitude:
     def __init__(self, env: gym.Env) -> None:
         self.env = env
         self.dt = env.unwrapped.dt
-        self.half_size = env.unwrapped.half_size
 
     @property
     def state(self) -> CPGState:
         return self.env.unwrapped.state
 
     def predict(self, obs: np.ndarray, *args, **kwargs) -> tuple[np.ndarray, dict]:
-        phase = self.state.phase[0] % np.pi
+        K = 1.0
+        phase = obs[0]
+        amplitude = obs[1]
 
-        amplitude = self.half_size / np.max(np.abs([np.cos(phase), np.sin(phase)]))
-        frequency = 1.0
+        if self.env.unwrapped.shape == "square":
+            intrinsic_amplitude = -sdf.square(
+                amplitude * np.array([np.cos(phase), np.sin(phase)]),
+                self.env.unwrapped.half_size,
+            )
+        elif self.env.unwrapped.shape == "ellipse":
+            intrinsic_amplitude = -sdf.ellipse(
+                amplitude * np.array([np.cos(phase), np.sin(phase)]),
+                self.env.unwrapped.a,
+                self.env.unwrapped.b,
+            )
+        else:
+            raise ValueError(f"Unknown shape: {self.env.unwrapped.shape}")
 
-        return np.array([[amplitude], [frequency]]), {}
+        return np.array([[intrinsic_amplitude * K], [0.0]]), {}
 
 
-model = MatchAmplitude(env)
-
-
-def visualize_run(env, model, steps=1000):
-    obs, _ = env.reset()
+def visualize_run(env: gym.Env, model, steps: int = 1000, seed: int = 0):
+    obs, _ = env.reset(seed=seed)
     states = []
     params = []
     rewards = []
 
-    for _ in range(steps):
+    for _ in tqdm(range(steps)):
         action, _ = model.predict(obs, deterministic=True)
         obs, reward, termination, truncation, _ = env.step(action)
         states.append(env.unwrapped.state)
-        params.append(cpg_env.action_to_params(action))
+        params.append(cpg_env.action_to_params(env.unwrapped.previous_action))
         rewards.append(reward)
 
         if termination or truncation:
             break
 
-    print(f"Total reward: {np.sum(rewards)}")
+    logging.info(f"Total reward: {sum(rewards)}")
 
     states_and_params = list(zip(states, params))
     plot_trajectory(states_and_params, env.unwrapped.dt)
@@ -56,4 +67,13 @@ def visualize_run(env, model, steps=1000):
     animate_trajectory(states_and_params)
 
 
-visualize_run(env, model, EPISODE_STEPS)
+env = gym.make(
+    "EllipseCPGEnv-v0",
+    n=1,
+    dt=1e-3,
+    state_noise=1.0,
+    observation_noise=0.001,
+    action_noise=0.001,
+)
+model = MatchAmplitude(env)
+visualize_run(env, model, 1000, 0)
