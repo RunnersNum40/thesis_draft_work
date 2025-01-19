@@ -7,6 +7,7 @@ from tqdm.rich import tqdm
 import cpg_env
 import sdf
 from cpg import CPGState
+from cpg_env_ppo import env_fn
 from visualization import animate_trajectory, plot_polar_trajectory, plot_trajectory
 
 logging.basicConfig(level=logging.INFO)
@@ -22,17 +23,16 @@ class MatchAmplitude:
         return self.env.unwrapped.state
 
     def predict(self, obs: np.ndarray, *args, **kwargs) -> tuple[np.ndarray, dict]:
-        K = 1.0
-        phase = obs[0]
-        amplitude = obs[1]
+        phase = obs[0][0]
+        amplitude = obs[1][0]
 
         if self.env.unwrapped.shape == "square":
-            intrinsic_amplitude = -sdf.square(
+            intrinsic_amplitude = amplitude - sdf.square(
                 amplitude * np.array([np.cos(phase), np.sin(phase)]),
                 self.env.unwrapped.half_size,
             )
         elif self.env.unwrapped.shape == "ellipse":
-            intrinsic_amplitude = -sdf.ellipse(
+            intrinsic_amplitude = amplitude - sdf.ellipse(
                 amplitude * np.array([np.cos(phase), np.sin(phase)]),
                 self.env.unwrapped.a,
                 self.env.unwrapped.b,
@@ -40,7 +40,7 @@ class MatchAmplitude:
         else:
             raise ValueError(f"Unknown shape: {self.env.unwrapped.shape}")
 
-        return np.array([[intrinsic_amplitude * K], [0.0]]), {}
+        return np.array([[intrinsic_amplitude], [np.pi / 2.0]]), {}
 
 
 def visualize_run(env: gym.Env, model, steps: int = 1000, seed: int = 0):
@@ -67,13 +67,7 @@ def visualize_run(env: gym.Env, model, steps: int = 1000, seed: int = 0):
     animate_trajectory(states_and_params)
 
 
-env = gym.make(
-    "EllipseCPGEnv-v0",
-    n=1,
-    dt=1e-3,
-    state_noise=1.0,
-    observation_noise=0.001,
-    action_noise=0.001,
-)
-model = MatchAmplitude(env)
-visualize_run(env, model, 1000, 0)
+if __name__ == "__main__":
+    env = env_fn()
+    model = MatchAmplitude(env)
+    visualize_run(env, model, 1000, 1)
