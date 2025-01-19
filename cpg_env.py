@@ -38,6 +38,7 @@ class CPGEnv(gym.Env):
         state_noise: float = 0.0,
         action_noise: float = 0.0,
         observation_noise: float = 0.0,
+        observe_actions: int = 1,
     ) -> None:
         self.n = n
         self.time_limit = time_limit
@@ -45,11 +46,12 @@ class CPGEnv(gym.Env):
         self.state_noise = state_noise
         self.action_noise = action_noise
         self.observation_noise = observation_noise
+        self.observe_actions = observe_actions
 
         self.observation_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(2, n),
+            shape=(2, n + self.observe_actions * n),
             dtype=np.float64,
         )
 
@@ -65,9 +67,12 @@ class CPGEnv(gym.Env):
 
     def _get_obs(self) -> np.ndarray:
         state_observation = state_to_observation(self.state)
+        action_observation = np.concatenate(self.previous_actions, axis=1)
 
-        return state_observation + self.np_random.normal(
-            0.0, self.observation_noise, state_observation.shape
+        observation = np.concatenate([state_observation, action_observation], axis=1)
+
+        return observation + self.np_random.normal(
+            0.0, self.observation_noise, observation.shape
         )
 
     def _get_reward(self) -> float:
@@ -91,6 +96,10 @@ class CPGEnv(gym.Env):
     def _get_info(self) -> dict:
         return {}
 
+    @property
+    def previous_action(self) -> np.ndarray:
+        return self.previous_actions[-1]
+
     def reset(
         self, seed: Optional[int] = None, options: Optional[dict] = None
     ) -> tuple[np.ndarray, dict]:
@@ -98,7 +107,9 @@ class CPGEnv(gym.Env):
 
         self.step_count = 0
 
-        self.previous_action: np.ndarray = self.action_space.sample()
+        self.previous_actions = [
+            self.action_space.sample() for _ in range(self.observe_actions)
+        ]
 
         self.previous_state = CPGState(
             self.np_random.uniform(-np.pi, np.pi, self.n),
@@ -116,7 +127,7 @@ class CPGEnv(gym.Env):
             action + self.np_random.normal(0.0, self.action_noise, action.shape)
         )
 
-        self.previous_action = action
+        self.previous_actions = self.previous_actions[1:] + [action]
         self.previous_state = self.state
         self.step_count += 1
 
@@ -172,14 +183,9 @@ class SquareCPGEnv(CPGEnv):
         return abs(sdf.square(np.array([x, y]), self.half_size))
 
 
-rescale_action_spec = gym.wrappers.RescaleAction.wrapper_spec(
-    min_action=-1, max_action=1
-)
-
 gym.register(
     id="SquareCPGEnv-v0",
     entry_point=lambda *args, **kwargs: SquareCPGEnv(*args, **kwargs),
-    additional_wrappers=(rescale_action_spec,),
 )
 
 
@@ -201,7 +207,6 @@ class EllipseCPGEnv(CPGEnv):
 gym.register(
     id="EllipseCPGEnv-v0",
     entry_point=lambda *args, **kwargs: EllipseCPGEnv(*args, **kwargs),
-    additional_wrappers=(rescale_action_spec,),
 )
 
 
