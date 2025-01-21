@@ -26,6 +26,10 @@ def state_to_observation(state: CPGState) -> np.ndarray:
     return np.array([state.phase, state.amplitude])
 
 
+def state_to_output(state: CPGState) -> np.ndarray:
+    return state.amplitude * np.array([np.cos(state.phase), np.sin(state.phase)])
+
+
 class CPGEnv(gym.Env):
     distance_weight = 1.0
     velocity_weight = 1.0
@@ -33,11 +37,12 @@ class CPGEnv(gym.Env):
     def __init__(
         self,
         n: int = 1,
-        time_limit: Optional[int] = 1024,
+        time_limit: Optional[int] = None,
         dt: float = 1e-3,
         state_noise: float = 0.0,
         action_noise: float = 0.0,
         observation_noise: float = 0.0,
+        time_step_range: tuple[int, int] = (1, 21),
         observe_actions: int = 1,
     ) -> None:
         self.n = n
@@ -46,17 +51,21 @@ class CPGEnv(gym.Env):
         self.state_noise = state_noise
         self.action_noise = action_noise
         self.observation_noise = observation_noise
+        self.time_step_range = time_step_range
         self.observe_actions = observe_actions
 
         self.observation_space = gym.spaces.Box(
             low=-np.inf,
             high=np.inf,
-            shape=(2, n + self.observe_actions * n),
+            shape=(
+                2,
+                n + n + self.observe_actions * n,
+            ),  # state, output, previous actions
             dtype=np.float64,
         )
 
-        action_low = np.array([0.0, np.pi / 4])
-        action_high = np.array([2.0, np.pi])
+        action_low = np.array([0.0, np.pi])
+        action_high = np.array([2.0, 2 * np.pi])
 
         self.action_space = gym.spaces.Box(
             low=np.repeat([action_low], n, axis=0).T,
@@ -68,8 +77,11 @@ class CPGEnv(gym.Env):
     def _get_obs(self) -> np.ndarray:
         state_observation = state_to_observation(self.state)
         action_observation = np.concatenate(self.previous_actions, axis=1)
+        output_observation = state_to_output(self.state)
 
-        observation = np.concatenate([state_observation, action_observation], axis=1)
+        observation = np.concatenate(
+            [state_observation, output_observation, action_observation], axis=1
+        )
 
         return observation + self.np_random.normal(
             0.0, self.observation_noise, observation.shape
@@ -132,7 +144,9 @@ class CPGEnv(gym.Env):
         self.step_count += 1
 
         self.state = step_cpg(
-            self.state, params, self.dt * self.np_random.integers(1, 21)
+            self.state,
+            params,
+            self.dt * self.np_random.integers(*self.time_step_range, endpoint=True),
         )
 
         if self.state_noise > 0.0:
