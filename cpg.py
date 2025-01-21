@@ -68,7 +68,7 @@ def step_cpg(state: CPGState, params: CPGParams, dt: float) -> CPGState:
 
 if __name__ == "__main__":
     from visualization import animate_trajectory, plot_polar_trajectory, plot_trajectory
-    from tqdm import tqdm
+    from tqdm.rich import tqdm
 
     intrinsic_amplitude = np.array([2.0, 1.0])
     intrinsic_frequency = np.array([2.0 * np.pi, -2.0 * np.pi])
