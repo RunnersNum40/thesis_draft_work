@@ -7,7 +7,6 @@ from tqdm.rich import tqdm
 import cpg_env
 import sdf
 from cpg import CPGState
-from cpg_env_ppo import env_fn
 from visualization import animate_trajectory, plot_polar_trajectory, plot_trajectory
 
 logging.basicConfig(level=logging.INFO)
@@ -68,6 +67,13 @@ def visualize_run(env: gym.Env, model, steps: int = 1000, seed: int = 0):
 
 
 if __name__ == "__main__":
-    env = env_fn()
+    env = gym.make(
+        "SquareCPGEnv-v0",
+        n=1,
+        state_noise=0.1,
+        observation_noise=0.01,
+        action_noise=0.01,
+        observe_actions=1,
+    )
     model = MatchAmplitude(env)
     visualize_run(env, model, 1000, 1)

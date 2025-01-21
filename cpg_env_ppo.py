@@ -14,9 +14,10 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 import cpg_env
 
 NUM_ENVS = 4
-EPISODE_STEPS = 10000
-TIMESTEPS = 10000000
-SAVE_INTERVAL = 100000
+EPISODE_STEPS = 500
+EVAL_STEPS = 500
+TIMESTEPS = 1e6
+SAVE_INTERVAL = 1e5
 SAVE_DIR = "checkpoints"
 LOG_DIR = "/tmp/tensorboard"
 BEST_MODEL_PATH = os.path.join(SAVE_DIR, "best_model.zip")
@@ -36,10 +37,19 @@ env_fn = make_env(
     "EllipseCPGEnv-v0",
     time_limit=EPISODE_STEPS,
     n=1,
-    state_noise=1.0,
+    state_noise=0.1,
     observation_noise=0.01,
     action_noise=0.01,
-    observe_actions=2,
+    observe_actions=1,
+)
+eval_env_fn = make_env(
+    "EllipseCPGEnv-v0",
+    time_limit=EVAL_STEPS,
+    n=1,
+    state_noise=0.0,
+    observation_noise=0.0,
+    action_noise=0.0,
+    observe_actions=1,
 )
 
 
@@ -52,7 +62,7 @@ if __name__ == "__main__":
     eval_env = env_fn()
 
     checkpoint_callback = CheckpointCallback(
-        save_freq=SAVE_INTERVAL,
+        save_freq=SAVE_INTERVAL // NUM_ENVS,
         save_path=SAVE_DIR,
         name_prefix="ppo_cpg",
         save_vecnormalize=True,
@@ -65,7 +75,7 @@ if __name__ == "__main__":
     eval_callback = EvalCallback(
         eval_env,
         best_model_save_path=SAVE_DIR,
-        eval_freq=SAVE_INTERVAL,
+        eval_freq=SAVE_INTERVAL // NUM_ENVS,
         callback_after_eval=stop_callback,
         verbose=1,
     )

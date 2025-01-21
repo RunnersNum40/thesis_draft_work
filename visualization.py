@@ -4,7 +4,11 @@ from matplotlib.animation import FuncAnimation
 from cpg import CPGParams, CPGState
 
 
-def plot_trajectory(states_and_params: list[tuple[CPGState, CPGParams]], dt: float):
+def plot_trajectory(
+    states_and_params: list[tuple[CPGState, CPGParams]],
+    dt: float,
+    show_params: bool = True,
+):
     phases = np.mod(
         np.array([state.phase for state, params in states_and_params]), np.pi
     )
@@ -26,18 +30,19 @@ def plot_trajectory(states_and_params: list[tuple[CPGState, CPGParams]], dt: flo
             amplitudes[:, i],
             label=f"Amplitude {i+1}",
         )
-        plt.plot(
-            np.arange(len(states_and_params)) * dt,
-            intrinsic_amplitudes[:, i],
-            "--",
-            label=f"Intrinsic Amplitude {i+1}",
-        )
-        plt.plot(
-            np.arange(len(states_and_params)) * dt,
-            intrinsic_frequencies[:, i],
-            "--",
-            label=f"Intrinsic Frequency {i+1}",
-        )
+        if show_params:
+            plt.plot(
+                np.arange(len(states_and_params)) * dt,
+                intrinsic_amplitudes[:, i],
+                "--",
+                label=f"Intrinsic Amplitude {i+1}",
+            )
+            plt.plot(
+                np.arange(len(states_and_params)) * dt,
+                intrinsic_frequencies[:, i],
+                "--",
+                label=f"Intrinsic Frequency {i+1}",
+            )
 
     plt.xlabel("Time (s)")
     plt.ylabel("Value")
@@ -45,7 +50,10 @@ def plot_trajectory(states_and_params: list[tuple[CPGState, CPGParams]], dt: flo
     plt.show()
 
 
-def plot_polar_trajectory(states_and_params: list[tuple[CPGState, CPGParams]]):
+def plot_polar_trajectory(
+    states_and_params: list[tuple[CPGState, CPGParams]],
+    show_params: bool = True,
+):
     phases = np.array([state.phase for state, params in states_and_params])
     amplitudes = np.array([state.amplitude for state, params in states_and_params])
     intrinsic_amplitudes = np.array(
@@ -56,12 +64,13 @@ def plot_polar_trajectory(states_and_params: list[tuple[CPGState, CPGParams]]):
     ax = plt.subplot(111, projection="polar")
     for i in range(phases.shape[1]):
         ax.plot(phases[:, i] % (2 * np.pi), amplitudes[:, i], label=f"Oscillator {i+1}")
-        ax.plot(
-            phases[:, i] % (2 * np.pi),
-            intrinsic_amplitudes[:, i],
-            "--",
-            label=f"Intrinsic Amplitude {i+1}",
-        )
+        if show_params:
+            ax.plot(
+                phases[:, i] % (2 * np.pi),
+                intrinsic_amplitudes[:, i],
+                "--",
+                label=f"Intrinsic Amplitude {i+1}",
+            )
 
     ax.set_rmin(0)
     ax.set_rmax(np.max(amplitudes) * 1.2)
