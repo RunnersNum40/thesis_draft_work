@@ -6,7 +6,7 @@ from tqdm.rich import tqdm
 
 import cpg_env
 import sdf
-from cpg import CPGState
+from cpg import CPGParams, CPGState
 from visualization import animate_trajectory, plot_polar_trajectory, plot_trajectory
 
 logging.basicConfig(level=logging.INFO)
@@ -42,7 +42,7 @@ class MatchAmplitude:
         return np.array([[intrinsic_amplitude], [np.pi / 2.0]]), {}
 
 
-def visualize_run(env: gym.Env, model, steps: int = 1000, seed: int = 0):
+def rollout_run(env: gym.Env, model, steps: int = 1000, seed: int = 0):
     obs, _ = env.reset(seed=seed)
     states = []
     params = []
@@ -60,9 +60,18 @@ def visualize_run(env: gym.Env, model, steps: int = 1000, seed: int = 0):
 
     logging.info(f"Total reward: {sum(rewards)}")
 
+    return sum(rewards), states, params
+
+
+def visualize_run(
+    env: gym.Env,
+    states: list[CPGState],
+    params: list[CPGParams],
+    show_params: bool = True,
+):
     states_and_params = list(zip(states, params))
-    plot_trajectory(states_and_params, env.unwrapped.dt)
-    plot_polar_trajectory(states_and_params)
+    plot_trajectory(states_and_params, env.unwrapped.dt * 10, show_params=show_params)
+    plot_polar_trajectory(states_and_params, show_params=show_params)
     animate_trajectory(states_and_params)
 
 
@@ -76,4 +85,6 @@ if __name__ == "__main__":
         observe_actions=1,
     )
     model = MatchAmplitude(env)
-    visualize_run(env, model, 1000, 1)
+    reward, states, params = rollout_run(env, model, 1000, 1)
+    print(f"Reward {reward}")
+    visualize_run(env, states, params)

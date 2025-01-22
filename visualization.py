@@ -36,12 +36,14 @@ def plot_trajectory(
                 intrinsic_amplitudes[:, i],
                 "--",
                 label=f"Intrinsic Amplitude {i+1}",
+                alpha=0.5,
             )
             plt.plot(
                 np.arange(len(states_and_params)) * dt,
                 intrinsic_frequencies[:, i],
                 "--",
                 label=f"Intrinsic Frequency {i+1}",
+                alpha=0.5,
             )
 
     plt.xlabel("Time (s)")
@@ -70,6 +72,7 @@ def plot_polar_trajectory(
                 intrinsic_amplitudes[:, i],
                 "--",
                 label=f"Intrinsic Amplitude {i+1}",
+                alpha=0.5,
             )
 
     ax.set_rmin(0)
