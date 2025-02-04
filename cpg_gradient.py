@@ -1,6 +1,8 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
-from torchdiffeq import odeint_adjoint as odeint
+from torchdiffeq import odeint
 
 
 def states_to_tensor(
@@ -75,12 +77,14 @@ class CPG(nn.Module):
         num_oscillators: int,
         convergence_factor: float,
         timestep: float = 0.01,
+        solver: Optional[str] = "rk4",
     ) -> None:
         super(CPG, self).__init__()
 
         self.num_oscillators = num_oscillators
         self.convergence_factor = convergence_factor
         self.timestep = timestep
+        self.solver = solver
 
         num_params = (
             num_oscillators  # intrinsic amplitudes
@@ -117,22 +121,10 @@ class CPG(nn.Module):
         )
 
         solution = odeint(
-            cpg_ode, state, torch.tensor([0, self.timestep]), method="heun3"
+            cpg_ode, state, torch.tensor([0, self.timestep]), method=self.solver
         )
 
         return solution[-1]
-
-    def random_state(self) -> torch.Tensor:
-        """
-        Sample a random state for the CPG system.
-
-        :return: A random state for the CPG system.
-        """
-        return states_to_tensor(
-            torch.ones(self.num_oscillators),
-            torch.zeros(self.num_oscillators),
-            torch.zeros(self.num_oscillators),
-        )
 
 
 class CPGNetwork(nn.Module):
@@ -145,8 +137,14 @@ class CPGNetwork(nn.Module):
         output_layers: list[int],
         timestep: float = 0.01,
         convergence_factor: float = 1.0,
+        solver: Optional[str] = "rk4",
     ) -> None:
         super(CPGNetwork, self).__init__()
+
+        self.num_oscillators = num_oscillators
+        self.timestep = timestep
+        self.convergence_factor = convergence_factor
+        self.solver = solver
 
         input_final_layer_size = (
             num_oscillators  # intrinsic amplitudes
@@ -170,6 +168,7 @@ class CPGNetwork(nn.Module):
             num_oscillators=num_oscillators,
             convergence_factor=convergence_factor,
             timestep=timestep,
+            solver=solver,
         )
 
         out_first_layer_size = 2 * num_oscillators
@@ -217,14 +216,6 @@ class CPGNetwork(nn.Module):
 
         return state.detach(), x
 
-    def sample_state(self) -> torch.Tensor:
-        """
-        Sample a random state for the CPG system.
-
-        :return: A random state for the CPG system.
-        """
-        return self.cpg_layer.random_state()
-
 
 if __name__ == "__main__":
     import warnings
@@ -232,7 +223,7 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
     import numpy as np
     from tqdm import TqdmExperimentalWarning
-    from tqdm.rich import tqdm
+    from tqdm.rich import trange
 
     warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 
@@ -249,7 +240,7 @@ if __name__ == "__main__":
         return np.array([x_bound, y_bound]) * half_size
 
     time = 1.0
-    timestep = 1e-2
+    timestep = 5e-3
     half_size = 1.0
     frequency = 1.0  # Hz
     t = np.linspace(0, time, int(time / timestep))
@@ -258,11 +249,20 @@ if __name__ == "__main__":
     t = torch.tensor(t, dtype=torch.float32)
     y = torch.tensor(y, dtype=torch.float32)
 
+    def default_state(num_oscillators: int) -> torch.Tensor:
+        return torch.cat(
+            [
+                torch.ones(num_oscillators),
+                torch.zeros(num_oscillators),
+                torch.zeros(num_oscillators),
+            ]
+        )
+
     def visualize(model: CPGNetwork, t: torch.Tensor, y: torch.Tensor) -> None:
         model.eval()
 
         with torch.no_grad():
-            state = model.sample_state()
+            state = default_state(model.cpg_layer.num_oscillators)
             y_pred = torch.empty((len(t), 2))
             for i in range(len(t)):
                 state, y_pred[i] = model(state, t[i])
@@ -286,18 +286,18 @@ if __name__ == "__main__":
         x: torch.Tensor,
         y: torch.Tensor,
         epochs: int = 1000,
-        lr: float = 1e-3,
+        lr: float = 1e-4,
         report_frequency: int = 100,
     ) -> None:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         criterion = nn.MSELoss()
 
         model.train()
-        for epoch in tqdm(range(epochs), leave=False):
+        for epoch in trange(epochs, leave=False):
             optimizer.zero_grad()
             loss = torch.tensor(0.0)
 
-            state = model.sample_state()
+            state = default_state(model.cpg_layer.num_oscillators)
             for i in range(len(y)):
                 state, y_pred = model(state, x[i])
                 loss += criterion(y_pred, y[i])
@@ -313,14 +313,14 @@ if __name__ == "__main__":
 
         print(f"Epoch {epochs}/{epochs}, Loss: {loss.item()}")
 
-    n = 3
+    n = 8
     model = CPGNetwork(
-        [1, 16, 16],
+        [1, 16, 32, 64],
         n,
-        [16, 16, 2],
+        [16, 2],
         timestep=timestep,
-        convergence_factor=10.0,
+        convergence_factor=100.0,
     )
 
-    train(model, t, y, 500)
+    train(model, t, y, 1000, lr=6e-4)
     visualize(model, t, y)
