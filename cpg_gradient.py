@@ -3,6 +3,22 @@ import torch.nn as nn
 from torchdiffeq import odeint_adjoint as odeint
 
 
+def states_to_tensor(
+    amplitudes: torch.Tensor, phases: torch.Tensor, amplitudes_dot: torch.Tensor
+) -> torch.Tensor:
+    return torch.cat([amplitudes, phases, amplitudes_dot])
+
+
+def tensor_to_states(
+    state: torch.Tensor, num_oscillators: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    amplitudes = state[:num_oscillators]
+    amplitudes_dot = state[num_oscillators * 2 : 3 * num_oscillators]
+    phases = state[num_oscillators : 2 * num_oscillators]
+
+    return amplitudes, phases, amplitudes_dot
+
+
 class CPGOde(nn.Module):
     """ODE Function for use with odeint"""
 
@@ -32,9 +48,7 @@ class CPGOde(nn.Module):
         :param y: The current state of the CPG system.
         :return: The derivative of the state of the CPG system.
         """
-        amplitudes = y[: self.num_oscillators]
-        phases = y[self.num_oscillators : 2 * self.num_oscillators]
-        amplitudes_dot = y[self.num_oscillators * 2 : 3 * self.num_oscillators]
+        amplitudes, amplitudes_dot, phases = tensor_to_states(y, self.num_oscillators)
 
         phase_dots = self.intrinsic_frequencies + torch.sum(
             (
@@ -50,7 +64,7 @@ class CPGOde(nn.Module):
             - amplitudes_dot
         )
 
-        return torch.cat([amplitudes_dot, phase_dots, amplitudes_dot_dot])
+        return states_to_tensor(amplitudes_dot, phase_dots, amplitudes_dot_dot)
 
 
 class CPG(nn.Module):
@@ -94,15 +108,31 @@ class CPG(nn.Module):
             2 * self.num_oscillators + self.num_oscillators**2 :
         ].reshape(self.num_oscillators, self.num_oscillators)
 
-        ode = CPGOde(
-            self.convergence_factor,
-            intrinsic_amplitudes,
-            intrinsic_frequencies,
-            coupling_weights,
-            phase_biases,
+        cpg_ode = CPGOde(
+            intrinsic_amplitudes=intrinsic_amplitudes,
+            intrinsic_frequencies=intrinsic_frequencies,
+            coupling_weights=coupling_weights,
+            phase_biases=phase_biases,
+            convergence_factor=self.convergence_factor,
         )
 
-        return odeint(ode, state, torch.tensor([0, self.timestep]))[-1]
+        solution = odeint(
+            cpg_ode, state, torch.tensor([0, self.timestep]), method="heun3"
+        )
+
+        return solution[-1]
+
+    def random_state(self) -> torch.Tensor:
+        """
+        Sample a random state for the CPG system.
+
+        :return: A random state for the CPG system.
+        """
+        return states_to_tensor(
+            torch.ones(self.num_oscillators),
+            torch.zeros(self.num_oscillators),
+            torch.zeros(self.num_oscillators),
+        )
 
 
 class CPGNetwork(nn.Module):
@@ -148,11 +178,16 @@ class CPGNetwork(nn.Module):
             nn.Sequential(
                 *[
                     nn.Sequential(nn.Linear(input_size, output_size), nn.ReLU())
-                    for input_size, output_size in zip(output_layers, output_layers[1:])
+                    for input_size, output_size in zip(
+                        output_layers[:-1], output_layers[:-1][1:]
+                    )
                 ]
             )
             if output_layers
             else nn.Identity()
+        )
+        self.output_network.add_module(
+            "final", nn.Linear(output_layers[-2], output_layers[-1])
         )
 
     def forward(
@@ -188,18 +223,22 @@ class CPGNetwork(nn.Module):
 
         :return: A random state for the CPG system.
         """
-        return (
-            torch.rand(self.cpg_layer.num_oscillators * 3, requires_grad=False) * 2 - 1
-        ).detach()
+        return self.cpg_layer.random_state()
 
 
 if __name__ == "__main__":
+    import warnings
+
     import matplotlib.pyplot as plt
     import numpy as np
+    from tqdm import TqdmExperimentalWarning
     from tqdm.rich import tqdm
+
+    warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 
     def square(angle: float | np.ndarray, half_size: float) -> float | np.ndarray:
         x, y = np.cos(angle), np.sin(angle)
+
         if np.abs(x) > np.abs(y):
             x_bound = np.sign(x)
             y_bound = y / np.abs(x)
@@ -224,12 +263,21 @@ if __name__ == "__main__":
 
         with torch.no_grad():
             state = model.sample_state()
-            y_pred = np.zeros((len(t), 2))
+            y_pred = torch.empty((len(t), 2))
             for i in range(len(t)):
                 state, y_pred[i] = model(state, t[i])
 
+        y_pred = y_pred.numpy()
+
         plt.plot(y_pred[:, 0], y_pred[:, 1], label="Predicted")
         plt.plot(y[:, 0], y[:, 1], label="True")
+        plt.legend()
+        plt.show()
+
+        plt.plot(t, y_pred[:, 0], "r-", label="Predicted x")
+        plt.plot(t, y[:, 0], "r--", label="True x")
+        plt.plot(t, y_pred[:, 1], "b-", label="Predicted y")
+        plt.plot(t, y[:, 1], "b--", label="True y")
         plt.legend()
         plt.show()
 
@@ -238,14 +286,14 @@ if __name__ == "__main__":
         x: torch.Tensor,
         y: torch.Tensor,
         epochs: int = 1000,
-        lr: float = 1e-4,
+        lr: float = 1e-3,
         report_frequency: int = 100,
     ) -> None:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         criterion = nn.MSELoss()
 
         model.train()
-        for epoch in tqdm(range(epochs)):
+        for epoch in tqdm(range(epochs), leave=False):
             optimizer.zero_grad()
             loss = torch.tensor(0.0)
 
@@ -263,14 +311,16 @@ if __name__ == "__main__":
             if epoch % report_frequency == 0:
                 print(f"Epoch {epoch}/{epochs}, Loss: {loss.item()}")
 
+        print(f"Epoch {epochs}/{epochs}, Loss: {loss.item()}")
+
     n = 3
     model = CPGNetwork(
-        [1],
+        [1, 16, 16],
         n,
-        [2],
+        [16, 16, 2],
         timestep=timestep,
         convergence_factor=10.0,
     )
 
-    train(model, t, y, 1000)
+    train(model, t, y, 500)
     visualize(model, t, y)
