@@ -76,8 +76,8 @@ class CPG(nn.Module):
         self,
         num_oscillators: int,
         convergence_factor: float,
-        timestep: float = 0.01,
-        solver: Optional[str] = "rk4",
+        timestep: float,
+        solver: Optional[str],
     ) -> None:
         super(CPG, self).__init__()
 
@@ -124,7 +124,10 @@ class CPG(nn.Module):
             cpg_ode, state, torch.tensor([0, self.timestep]), method=self.solver
         )
 
-        return solution[-1]
+        if solution is None:
+            raise ValueError("Integration failed")
+
+        return solution[-1]  # pyright: ignore
 
 
 class CPGNetwork(nn.Module):
@@ -135,16 +138,37 @@ class CPGNetwork(nn.Module):
         input_layers: list[int],
         num_oscillators: int,
         output_layers: list[int],
-        timestep: float = 0.01,
-        convergence_factor: float = 1.0,
+        timestep: float = 1e-3,
+        convergence_factor: float = 1000.0,
         solver: Optional[str] = "rk4",
+        state_feedback: bool = False,
+        param_feedback: bool = False,
+        bypass_layer: int = 0,
     ) -> None:
+        """
+        Create a CPG network.
+
+        :param input_layers: The sizes of the layers in the input network.
+            If the list is empty, the input size must match the number of oscillator parameters.
+        :param num_oscillators: The number of oscillators in the CPG system.
+        :param output_layers: The sizes of the layers in the output network.
+            If the list is empty, the number of oscillators must match the output size // 2.
+        :param timestep: The timestep for the CPG system.
+        :param convergence_factor: The convergence factor for the CPG system.
+        :param solver: The solver to use for the CPG system.
+        :param state_feedback: Whether to provide the CPG state as input to the input network.
+        :param param_feedback: Whether to provide the CPG parameters chosen by the input network
+            as input to the output network.
+        """
+
         super(CPGNetwork, self).__init__()
 
         self.num_oscillators = num_oscillators
         self.timestep = timestep
         self.convergence_factor = convergence_factor
         self.solver = solver
+        self.param_feedback = param_feedback
+        self.state_feedback = state_feedback
 
         input_final_layer_size = (
             num_oscillators  # intrinsic amplitudes
@@ -152,22 +176,10 @@ class CPGNetwork(nn.Module):
             + num_oscillators**2  # coupling weights
             + num_oscillators**2  # phase biases
         )
+        if state_feedback:
+            input_layers[0] += 2 * num_oscillators
         input_layers = input_layers + [input_final_layer_size]
-        self.input_network = (
-            nn.Sequential(
-                *[
-                    nn.Sequential(nn.Linear(input_size, output_size), nn.ReLU())
-                    for input_size, output_size in zip(
-                        input_layers[:-1], input_layers[:-1][1:]
-                    )
-                ]
-            )
-            if input_layers
-            else nn.Identity()
-        )
-        self.input_network.add_module(
-            "final", nn.Linear(input_layers[-2], input_layers[-1])
-        )
+        self.input_network = self.make_subnetwork(input_layers)
 
         self.cpg_layer = CPG(
             num_oscillators=num_oscillators,
@@ -177,22 +189,37 @@ class CPGNetwork(nn.Module):
         )
 
         out_first_layer_size = 2 * num_oscillators
+        if param_feedback:
+            out_first_layer_size += input_final_layer_size
+        if bypass_layer:
+            out_first_layer_size += bypass_layer
         output_layers = [out_first_layer_size] + output_layers
-        self.output_network = (
-            nn.Sequential(
-                *[
-                    nn.Sequential(nn.Linear(input_size, output_size), nn.ReLU())
-                    for input_size, output_size in zip(
-                        output_layers[:-1], output_layers[:-1][1:]
-                    )
-                ]
-            )
-            if output_layers
-            else nn.Identity()
-        )
-        self.output_network.add_module(
-            "final", nn.Linear(output_layers[-2], output_layers[-1])
-        )
+        self.output_network = self.make_subnetwork(output_layers)
+
+    @staticmethod
+    def make_subnetwork(layers: list[int]) -> nn.Sequential | nn.Identity | nn.Linear:
+        """
+        Return a subnetwork based on the given layers.
+
+        A subnetwork is a sequence of linear layers with ReLU activation functions in between
+        all layers and not after last one.
+
+        :param layers: The sizes of the layers in the subnetwork.
+        "return: A subnetwork based on the given layers.
+        """
+        if len(layers) == 1:
+            return nn.Identity()
+
+        if len(layers) == 2:
+            return nn.Linear(layers[0], layers[1])
+
+        layers_ = []
+        for n, (in_size, out_size) in enumerate(zip(layers, layers[1:])):
+            layers_.append(nn.Linear(in_size, out_size))
+            if n < len(layers) - 2:
+                layers_.append(nn.ReLU())
+
+        return nn.Sequential(*layers_)
 
     def forward(
         self, state: torch.Tensor, x: torch.Tensor
@@ -207,6 +234,12 @@ class CPGNetwork(nn.Module):
         if x.ndim < 1:
             x = x.unsqueeze(0)
 
+        if self.state_feedback:
+            amplitudes, phases, _ = tensor_to_states(
+                state, self.cpg_layer.num_oscillators
+            )
+            x = torch.cat([x, amplitudes, phases])
+
         x = self.input_network(x)
 
         state = self.cpg_layer(state, x)
@@ -215,7 +248,14 @@ class CPGNetwork(nn.Module):
         phases = state[
             self.cpg_layer.num_oscillators : 2 * self.cpg_layer.num_oscillators
         ]
-        x = torch.cat([amplitudes * torch.sin(phases), amplitudes * torch.cos(phases)])
+        cpg_output = torch.cat(
+            [amplitudes * torch.cos(phases), amplitudes * torch.sin(phases)]
+        )
+
+        if self.param_feedback:
+            x = torch.cat([x, cpg_output])
+        elif self.state_feedback:
+            x = cpg_output
 
         x = self.output_network(x)
 
@@ -232,36 +272,28 @@ if __name__ == "__main__":
 
     warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 
-    def square(angle: float | np.ndarray, half_size: float) -> np.ndarray:
+    def square(angle: np.ndarray, half_size: float) -> np.ndarray:
         """
-        Returns the position of a point on a square with side length 2 * half_size for a given angle.
+        Returns the position of points on a square with side length 2 * half_size for given angles.
 
-        :param angle: The angle of the point from the x-axis.
+        :param angle: Array of angles from the x-axis.
         :param half_size: Half the side length of the square.
-        :return: The position of the point.
+        :return: The positions of the points as an array of shape (N, 2).
         """
         x, y = np.cos(angle), np.sin(angle)
 
-        x_bound, y_bound = np.zeros_like(x), np.zeros_like(y)
+        x_bound = np.zeros_like(x)
+        y_bound = np.zeros_like(y)
 
-        if np.abs(x) > np.abs(y):
-            y_bound = y / np.abs(x)
-            x_bound = np.sign(x)
-        else:
-            x_bound = x / np.abs(y)
-            y_bound = np.sign(y)
+        mask_x = np.abs(x) > np.abs(y)
+
+        x_bound[mask_x] = np.sign(x[mask_x])
+        y_bound[mask_x] = y[mask_x] / np.abs(x[mask_x])
+
+        x_bound[~mask_x] = x[~mask_x] / np.abs(y[~mask_x])
+        y_bound[~mask_x] = np.sign(y[~mask_x])
 
         return np.stack([x_bound, y_bound], axis=-1) * half_size
-
-    time = 1.0
-    timestep = 5e-3
-    half_size = 1.0
-    frequency = 1.0  # Hz
-    t = np.linspace(0, time, int(time / timestep))
-    y = np.array([square(2 * np.pi * frequency * t, half_size) for t in t])
-
-    t = torch.tensor(t, dtype=torch.float32)
-    y = torch.tensor(y, dtype=torch.float32)
 
     def default_state(num_oscillators: int) -> torch.Tensor:
         return torch.cat(
@@ -352,15 +384,27 @@ if __name__ == "__main__":
                     f"Epoch {epoch + 1 if epoch > 0 else 0}/{epochs}, Loss: {loss.item()}"
                 )
 
-    n = 4
+    time = 1.0
+    timestep = 5e-3
+    half_size = 1.0
+    frequency = 1.0  # Hz
+    t = np.linspace(0, time, int(time / timestep))
+    y = square(2 * np.pi * frequency * t, half_size)
+
+    t = torch.tensor(t, dtype=torch.float32)
+    y = torch.tensor(y, dtype=torch.float32)
+
+    n = 1
     model = CPGNetwork(
-        [1, 64, 64],
+        [1, 64],
         n,
-        [64, 64, 2],
+        [16, 2],
         timestep=timestep,
         convergence_factor=1000.0,
         solver="euler",
+        state_feedback=True,
+        param_feedback=True,
     )
 
-    train(model, t, y, 10000, lr=1e-5)
+    train(model, t, y, 100, lr=4e-4)
     visualize(model, t, y)
