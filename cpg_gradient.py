@@ -157,11 +157,16 @@ class CPGNetwork(nn.Module):
             nn.Sequential(
                 *[
                     nn.Sequential(nn.Linear(input_size, output_size), nn.ReLU())
-                    for input_size, output_size in zip(input_layers, input_layers[1:])
+                    for input_size, output_size in zip(
+                        input_layers[:-1], input_layers[:-1][1:]
+                    )
                 ]
             )
             if input_layers
             else nn.Identity()
+        )
+        self.input_network.add_module(
+            "final", nn.Linear(input_layers[-2], input_layers[-1])
         )
 
         self.cpg_layer = CPG(
@@ -227,24 +232,33 @@ if __name__ == "__main__":
 
     warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 
-    def square(angle: float | np.ndarray, half_size: float) -> float | np.ndarray:
+    def square(angle: float | np.ndarray, half_size: float) -> np.ndarray:
+        """
+        Returns the position of a point on a square with side length 2 * half_size for a given angle.
+
+        :param angle: The angle of the point from the x-axis.
+        :param half_size: Half the side length of the square.
+        :return: The position of the point.
+        """
         x, y = np.cos(angle), np.sin(angle)
 
-        if np.abs(x) > np.abs(y):
-            x_bound = np.sign(x)
-            y_bound = y / np.abs(x)
-        else:
-            y_bound = np.sign(y)
-            x_bound = x / np.abs(y)
+        x_bound, y_bound = np.zeros_like(x), np.zeros_like(y)
 
-        return np.array([x_bound, y_bound]) * half_size
+        if np.abs(x) > np.abs(y):
+            y_bound = y / np.abs(x)
+            x_bound = np.sign(x)
+        else:
+            x_bound = x / np.abs(y)
+            y_bound = np.sign(y)
+
+        return np.stack([x_bound, y_bound], axis=-1) * half_size
 
     time = 1.0
     timestep = 5e-3
     half_size = 1.0
     frequency = 1.0  # Hz
     t = np.linspace(0, time, int(time / timestep))
-    y = np.array([square(angle, half_size) for angle in 2 * np.pi * frequency * t])
+    y = np.array([square(2 * np.pi * frequency * t, half_size) for t in t])
 
     t = torch.tensor(t, dtype=torch.float32)
     y = torch.tensor(y, dtype=torch.float32)
@@ -263,21 +277,46 @@ if __name__ == "__main__":
 
         with torch.no_grad():
             state = default_state(model.cpg_layer.num_oscillators)
+            amplitudes = []
+            phases = []
             y_pred = torch.empty((len(t), 2))
             for i in range(len(t)):
                 state, y_pred[i] = model(state, t[i])
+                amplitude, phase, _ = tensor_to_states(
+                    state, model.cpg_layer.num_oscillators
+                )
+                amplitudes.append(amplitude)
+                phases.append(phase)
 
         y_pred = y_pred.numpy()
+        amplitudes = torch.stack(amplitudes).numpy()
+        phases = torch.stack(phases).numpy()
 
-        plt.plot(y_pred[:, 0], y_pred[:, 1], label="Predicted")
-        plt.plot(y[:, 0], y[:, 1], label="True")
+        occilator_x = amplitudes * np.cos(phases)
+        occilator_y = amplitudes * np.sin(phases)
+
+        plt.plot(y[:, 0], y[:, 1], "b--", label="True")
+        plt.plot(y_pred[:, 0], y_pred[:, 1], "r-", label="Predicted")
         plt.legend()
         plt.show()
 
+        plt.plot(y[:, 0], y[:, 1], "b--", label="True")
+        plt.plot(occilator_x, occilator_y, "-", label="Oscillators")
+        plt.legend()
+        plt.show()
+
+        plt.plot(t, y[:, 0], "b--", label="True x")
+        plt.plot(t, y[:, 1], "r--", label="True y")
         plt.plot(t, y_pred[:, 0], "r-", label="Predicted x")
-        plt.plot(t, y[:, 0], "r--", label="True x")
         plt.plot(t, y_pred[:, 1], "b-", label="Predicted y")
-        plt.plot(t, y[:, 1], "b--", label="True y")
+        plt.legend()
+        plt.show()
+
+        plt.plot(t, y[:, 0], "b--", label="True x")
+        plt.plot(t, y[:, 1], "r--", label="True y")
+        plt.plot(t, occilator_x, "-", label="Oscillator x")
+        plt.plot(t, occilator_y, "-", label="Oscillator y")
+
         plt.legend()
         plt.show()
 
@@ -308,19 +347,20 @@ if __name__ == "__main__":
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
             optimizer.step()
 
-            if epoch % report_frequency == 0:
-                print(f"Epoch {epoch}/{epochs}, Loss: {loss.item()}")
+            if (epoch + 1) % report_frequency == 0 or epoch == 0:
+                print(
+                    f"Epoch {epoch + 1 if epoch > 0 else 0}/{epochs}, Loss: {loss.item()}"
+                )
 
-        print(f"Epoch {epochs}/{epochs}, Loss: {loss.item()}")
-
-    n = 8
+    n = 4
     model = CPGNetwork(
-        [1, 16, 32, 64],
+        [1, 64, 64],
         n,
-        [16, 2],
+        [64, 64, 2],
         timestep=timestep,
-        convergence_factor=100.0,
+        convergence_factor=1000.0,
+        solver="euler",
     )
 
-    train(model, t, y, 1000, lr=6e-4)
+    train(model, t, y, 10000, lr=1e-5)
     visualize(model, t, y)
