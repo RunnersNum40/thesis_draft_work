@@ -76,14 +76,12 @@ class CPG(nn.Module):
         self,
         num_oscillators: int,
         convergence_factor: float,
-        timestep: float,
         solver: Optional[str],
     ) -> None:
         super(CPG, self).__init__()
 
         self.num_oscillators = num_oscillators
         self.convergence_factor = convergence_factor
-        self.timestep = timestep
         self.solver = solver
 
         num_params = (
@@ -94,7 +92,9 @@ class CPG(nn.Module):
         )
         self.input_size = num_params
 
-    def forward(self, state: torch.Tensor, params: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, state: torch.Tensor, params: torch.Tensor, timestep: float | torch.Tensor
+    ) -> torch.Tensor:
         """
         Forward pass of the CPG model.
 
@@ -121,7 +121,7 @@ class CPG(nn.Module):
         )
 
         solution = odeint(
-            cpg_ode, state, torch.tensor([0, self.timestep]), method=self.solver
+            cpg_ode, state, torch.tensor([0, timestep]), method=self.solver
         )
 
         if solution is None:
@@ -131,14 +131,18 @@ class CPG(nn.Module):
 
 
 class CPGNetwork(nn.Module):
-    """MLP network with a CPG layer"""
+    """MLP network with a CPG layer
+
+    A CPG network contains an input processing network, a stateful CPG layer, and an
+    output processing network. The input network determines the parameters of the CPG,
+    and the output network determines an output from the CPG state.
+    """
 
     def __init__(
         self,
         input_layers: list[int],
         num_oscillators: int,
         output_layers: list[int],
-        timestep: float = 1e-3,
         convergence_factor: float = 1000.0,
         solver: Optional[str] = "rk4",
         state_feedback: bool = False,
@@ -156,19 +160,19 @@ class CPGNetwork(nn.Module):
         :param timestep: The timestep for the CPG system.
         :param convergence_factor: The convergence factor for the CPG system.
         :param solver: The solver to use for the CPG system.
-        :param state_feedback: Whether to provide the CPG state as input to the input network.
-        :param param_feedback: Whether to provide the CPG parameters chosen by the input network
-            as input to the output network.
+        :param state_feedback: Whether to feed the CPG state into the input processing network.
+        :param param_feedback: Whether to feed the computed CPG parameters into the output
+            processing network.
         """
 
         super(CPGNetwork, self).__init__()
 
         self.num_oscillators = num_oscillators
-        self.timestep = timestep
         self.convergence_factor = convergence_factor
         self.solver = solver
         self.param_feedback = param_feedback
         self.state_feedback = state_feedback
+        self.bypass_layer = bypass_layer
 
         input_final_layer_size = (
             num_oscillators  # intrinsic amplitudes
@@ -176,24 +180,23 @@ class CPGNetwork(nn.Module):
             + num_oscillators**2  # coupling weights
             + num_oscillators**2  # phase biases
         )
+        input_layers[0] += 1  # timestep
         if state_feedback:
             input_layers[0] += 2 * num_oscillators
-        input_layers = input_layers + [input_final_layer_size]
+        input_layers = input_layers + [input_final_layer_size + bypass_layer]
         self.input_network = self.make_subnetwork(input_layers)
 
         self.cpg_layer = CPG(
             num_oscillators=num_oscillators,
             convergence_factor=convergence_factor,
-            timestep=timestep,
             solver=solver,
         )
 
         out_first_layer_size = 2 * num_oscillators
         if param_feedback:
             out_first_layer_size += input_final_layer_size
-        if bypass_layer:
-            out_first_layer_size += bypass_layer
-        output_layers = [out_first_layer_size] + output_layers
+
+        output_layers = [out_first_layer_size + bypass_layer] + output_layers
         self.output_network = self.make_subnetwork(output_layers)
 
     @staticmethod
@@ -222,7 +225,7 @@ class CPGNetwork(nn.Module):
         return nn.Sequential(*layers_)
 
     def forward(
-        self, state: torch.Tensor, x: torch.Tensor
+        self, state: torch.Tensor, x: torch.Tensor, timestep: float | torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass of the CPG network.
@@ -235,14 +238,25 @@ class CPGNetwork(nn.Module):
             x = x.unsqueeze(0)
 
         if self.state_feedback:
-            amplitudes, phases, _ = tensor_to_states(
-                state, self.cpg_layer.num_oscillators
+            amplitudes, phases, _ = tensor_to_states(state, self.num_oscillators)
+            x = torch.cat(
+                [
+                    x,
+                    amplitudes,
+                    phases,
+                ]
             )
-            x = torch.cat([x, amplitudes, phases])
+
+        x = torch.cat([x, torch.tensor([timestep])])
 
         x = self.input_network(x)
 
-        state = self.cpg_layer(state, x)
+        if self.bypass_layer:
+            params, bypass = x[: -self.bypass_layer], x[-self.bypass_layer :]
+        else:
+            params, bypass = x, torch.tensor([])
+
+        state = self.cpg_layer(state, params, timestep)
 
         amplitudes = state[: self.cpg_layer.num_oscillators]
         phases = state[
@@ -253,9 +267,9 @@ class CPGNetwork(nn.Module):
         )
 
         if self.param_feedback:
-            x = torch.cat([x, cpg_output])
-        elif self.state_feedback:
-            x = cpg_output
+            x = torch.cat([params, cpg_output, bypass])
+        else:
+            x = torch.cat([cpg_output, bypass])
 
         x = self.output_network(x)
 
@@ -304,7 +318,12 @@ if __name__ == "__main__":
             ]
         )
 
-    def visualize(model: CPGNetwork, t: torch.Tensor, y: torch.Tensor) -> None:
+    def visualize(
+        model: CPGNetwork,
+        t: torch.Tensor,
+        y: torch.Tensor,
+        timestep: float | torch.Tensor,
+    ) -> None:
         model.eval()
 
         with torch.no_grad():
@@ -313,7 +332,7 @@ if __name__ == "__main__":
             phases = []
             y_pred = torch.empty((len(t), 2))
             for i in range(len(t)):
-                state, y_pred[i] = model(state, t[i])
+                state, y_pred[i] = model(state, t[i], timestep)
                 amplitude, phase, _ = tensor_to_states(
                     state, model.cpg_layer.num_oscillators
                 )
@@ -339,8 +358,8 @@ if __name__ == "__main__":
 
         plt.plot(t, y[:, 0], "b--", label="True x")
         plt.plot(t, y[:, 1], "r--", label="True y")
-        plt.plot(t, y_pred[:, 0], "r-", label="Predicted x")
-        plt.plot(t, y_pred[:, 1], "b-", label="Predicted y")
+        plt.plot(t, y_pred[:, 0], "b-", label="Predicted x")
+        plt.plot(t, y_pred[:, 1], "r-", label="Predicted y")
         plt.legend()
         plt.show()
 
@@ -359,6 +378,7 @@ if __name__ == "__main__":
         epochs: int = 1000,
         lr: float = 1e-4,
         report_frequency: int = 100,
+        timestep: float = 5e-3,
     ) -> None:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         criterion = nn.MSELoss()
@@ -370,7 +390,7 @@ if __name__ == "__main__":
 
             state = default_state(model.cpg_layer.num_oscillators)
             for i in range(len(y)):
-                state, y_pred = model(state, x[i])
+                state, y_pred = model(state, x[i], timestep)
                 loss += criterion(y_pred, y[i])
 
             loss /= len(y)
@@ -384,7 +404,7 @@ if __name__ == "__main__":
                     f"Epoch {epoch + 1 if epoch > 0 else 0}/{epochs}, Loss: {loss.item()}"
                 )
 
-    time = 1.0
+    time = 2.0
     timestep = 5e-3
     half_size = 1.0
     frequency = 1.0  # Hz
@@ -394,17 +414,15 @@ if __name__ == "__main__":
     t = torch.tensor(t, dtype=torch.float32)
     y = torch.tensor(y, dtype=torch.float32)
 
-    n = 1
+    n = 2
     model = CPGNetwork(
-        [1, 64],
+        [1, 64, 64],
         n,
-        [16, 2],
-        timestep=timestep,
+        [2],
         convergence_factor=1000.0,
-        solver="euler",
+        solver="rk4",
         state_feedback=True,
-        param_feedback=True,
     )
 
-    train(model, t, y, 100, lr=4e-4)
-    visualize(model, t, y)
+    train(model, t, y, epochs=3000, lr=1e-4, timestep=timestep)
+    visualize(model, t, y, timestep=timestep)
