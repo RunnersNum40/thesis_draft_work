@@ -174,6 +174,8 @@ class CPGNetwork(nn.Module):
         self.state_feedback = state_feedback
         self.bypass_layer = bypass_layer
 
+        self.state_shape = (3 * self.num_oscillators,)
+
         input_final_layer_size = (
             num_oscillators  # intrinsic amplitudes
             + num_oscillators  # intrinsic frequencies
