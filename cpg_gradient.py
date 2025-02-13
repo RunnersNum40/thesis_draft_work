@@ -31,6 +31,75 @@ def tensor_to_states(
     return amplitudes, phases, amplitudes_dot
 
 
+def params_to_tensor(
+    intrinsic_amplitudes: torch.Tensor,
+    intrinsic_frequencies: torch.Tensor,
+    coupling_weights: torch.Tensor,
+    phase_biases: torch.Tensor,
+) -> torch.Tensor:
+    if not all(
+        intrinsic_amplitudes.ndim == param.ndim
+        for param in [intrinsic_frequencies, coupling_weights, phase_biases]
+    ):
+        raise ValueError("All inputs must have the same number of dimensions")
+
+    if intrinsic_amplitudes.ndim == 1:
+        return torch.cat(
+            [
+                intrinsic_amplitudes,
+                intrinsic_frequencies,
+                coupling_weights.flatten(),
+                phase_biases.flatten(),
+            ]
+        )
+
+    else:
+        return torch.cat(
+            [
+                intrinsic_amplitudes,
+                intrinsic_frequencies,
+                coupling_weights.view(-1),
+                phase_biases.view(-1),
+            ],
+            dim=1,
+        )
+
+
+def tensor_to_params(
+    params: torch.Tensor, num_oscillators: int
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    if params.ndim == 1:
+        intrinsic_amplitudes = params[:num_oscillators]
+        intrinsic_frequencies = params[num_oscillators : 2 * num_oscillators]
+        coupling_weights = params[
+            2 * num_oscillators : 2 * num_oscillators + num_oscillators**2
+        ].reshape(num_oscillators, num_oscillators)
+        phase_biases = params[2 * num_oscillators + num_oscillators**2 :].reshape(
+            num_oscillators, num_oscillators
+        )
+        return (
+            intrinsic_amplitudes,
+            intrinsic_frequencies,
+            coupling_weights,
+            phase_biases,
+        )
+    else:
+        intrinsic_amplitudes = params[:, :num_oscillators]
+        intrinsic_frequencies = params[:, num_oscillators : 2 * num_oscillators]
+        coupling_weights = params[
+            :, 2 * num_oscillators : 2 * num_oscillators + num_oscillators**2
+        ].reshape(-1, num_oscillators, num_oscillators)
+        phase_biases = params[:, 2 * num_oscillators + num_oscillators**2 :].reshape(
+            -1, num_oscillators, num_oscillators
+        )
+        return (
+            intrinsic_amplitudes,
+            intrinsic_frequencies,
+            coupling_weights,
+            phase_biases,
+        )
+
+
 class CPGOde(nn.Module):
     """ODE Function for use with odeint"""
 
@@ -62,14 +131,13 @@ class CPGOde(nn.Module):
         """
         amplitudes, amplitudes_dot, phases = tensor_to_states(y, self.num_oscillators)
 
-        phase_dots = self.intrinsic_frequencies + torch.sum(
-            (
-                amplitudes[:, None]
-                * self.coupling_weights
-                * torch.sin(phases[None, :] - phases[:, None] - self.phase_biases)
-            ),
-            dim=1,
+        phase_diff = phases[:, None] - phases[None, :]
+        coupling_term = (
+            amplitudes[:, None]
+            * self.coupling_weights
+            * torch.sin(phase_diff - self.phase_biases)
         )
+        phase_dots = self.intrinsic_frequencies + torch.sum(coupling_term, dim=1)
 
         amplitudes_dot_dot = self.convergence_factor * (
             self.convergence_factor / 4 * (self.intrinsic_amplitudes - amplitudes)
@@ -112,15 +180,9 @@ class CPG(nn.Module):
         :param params: The parameters of the CPG system.
         :return: The next state of the CPG system.
         """
-        intrinsic_amplitudes = params[: self.num_oscillators]
-        intrinsic_frequencies = params[self.num_oscillators : 2 * self.num_oscillators]
-        coupling_weights = params[
-            2 * self.num_oscillators : 2 * self.num_oscillators
-            + self.num_oscillators**2
-        ].reshape(self.num_oscillators, self.num_oscillators)
-        phase_biases = params[
-            2 * self.num_oscillators + self.num_oscillators**2 :
-        ].reshape(self.num_oscillators, self.num_oscillators)
+        intrinsic_amplitudes, intrinsic_frequencies, coupling_weights, phase_biases = (
+            tensor_to_params(params, self.num_oscillators)
+        )
 
         cpg_ode = CPGOde(
             intrinsic_amplitudes=intrinsic_amplitudes,
