@@ -8,16 +8,26 @@ from torchdiffeq import odeint
 def states_to_tensor(
     amplitudes: torch.Tensor, phases: torch.Tensor, amplitudes_dot: torch.Tensor
 ) -> torch.Tensor:
-    return torch.cat([amplitudes, phases, amplitudes_dot])
+    if amplitudes.ndim != phases.ndim or amplitudes.ndim != amplitudes_dot.ndim:
+        raise ValueError("All inputs must have the same number of dimensions")
+
+    if amplitudes.ndim == 1:
+        return torch.cat([amplitudes, phases, amplitudes_dot])
+    else:
+        return torch.cat([amplitudes, phases, amplitudes_dot], dim=1)
 
 
 def tensor_to_states(
     state: torch.Tensor, num_oscillators: int
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    amplitudes = state[:num_oscillators]
-    amplitudes_dot = state[num_oscillators * 2 : 3 * num_oscillators]
-    phases = state[num_oscillators : 2 * num_oscillators]
-
+    if state.ndim == 1:
+        amplitudes = state[:num_oscillators]
+        phases = state[num_oscillators : 2 * num_oscillators]
+        amplitudes_dot = state[2 * num_oscillators : 3 * num_oscillators]
+    else:
+        amplitudes = state[:, :num_oscillators]
+        phases = state[:, num_oscillators : 2 * num_oscillators]
+        amplitudes_dot = state[:, 2 * num_oscillators : 3 * num_oscillators]
     return amplitudes, phases, amplitudes_dot
 
 
