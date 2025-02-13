@@ -129,7 +129,7 @@ class CPGOde(nn.Module):
         :param y: The current state of the CPG system.
         :return: The derivative of the state of the CPG system.
         """
-        amplitudes, amplitudes_dot, phases = tensor_to_states(y, self.num_oscillators)
+        amplitudes, phases, amplitudes_dot = tensor_to_states(y, self.num_oscillators)
 
         phase_diff = phases[:, None] - phases[None, :]
         coupling_term = (
