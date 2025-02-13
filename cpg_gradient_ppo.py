@@ -12,9 +12,10 @@ import torch.nn as nn
 import torch.optim as optim
 import tyro
 from torch.distributions.normal import Normal
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter  # pyright: ignore
 from tqdm import TqdmExperimentalWarning
 from tqdm.rich import trange
+from functorch import vmap
 
 from cpg_gradient import CPGNetwork
 
@@ -114,21 +115,28 @@ class Agent(nn.Module):
             state_feedback=True,
         )
 
-        self.actor_logstd = nn.Parameter(torch.zeros(np.prod(env.action_space.shape)))
+        self.actor_logstd = nn.Parameter(
+            torch.zeros(int(np.prod(env.action_space.shape)))
+        )
 
     def get_value(self, x):
         return self.critic(x)
 
     def get_action_and_value(
-        self, x: torch.Tensor, action: Optional[torch.Tensor] = None
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        action_mean = self.actor_mean(x)
+        self,
+        state: torch.Tensor,
+        x: torch.Tensor,
+        timestep: float,
+        action: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        state, action_mean = self.actor_mean(state, x, timestep)
         action_std = torch.exp(self.actor_logstd)
         probs = Normal(action_mean, action_std)
         if action is None:
             action = probs.sample()
 
         return (
+            state,
             action,
             probs.log_prob(action).sum(-1),
             probs.entropy().sum(-1),
@@ -175,12 +183,14 @@ if __name__ == "__main__":
         env, lambda obs: np.clip(obs, -10, 10), env.observation_space
     )
     env = gym.wrappers.NormalizeReward(env, gamma=args.gamma)
-    env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
+    env = gym.wrappers.TransformReward(
+        env, lambda reward: np.clip(float(reward), -10.0, 10.0)
+    )
     assert isinstance(
         env.action_space, gym.spaces.Box
     ), "only continuous action space is supported"
 
-    agent = Agent(env).to(device)
+    agent = Agent(env, args).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
     if args.anneal_lr:
         scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -189,6 +199,7 @@ if __name__ == "__main__":
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps,) + env.observation_space.shape).to(device)
+    states = torch.zeros((args.num_steps,) + agent.actor_mean.state_shape).to(device)
     actions = torch.zeros((args.num_steps,) + env.action_space.shape).to(device)
     logprobs = torch.zeros(args.num_steps).to(device)
     rewards = torch.zeros(args.num_steps).to(device)
@@ -199,6 +210,7 @@ if __name__ == "__main__":
     global_step = 0
     start_time = time.time()
     next_obs, _ = env.reset(seed=random.randint(0, 10000))
+    state = torch.zeros(agent.actor_mean.state_shape).to(device)
     next_obs = torch.tensor(next_obs).to(device)
     next_done = torch.zeros(1).to(device)
 
@@ -210,11 +222,14 @@ if __name__ == "__main__":
         for step in range(0, args.num_steps):
             global_step += 1
             obs[step] = next_obs
+            states[step] = state
             dones[step] = next_done
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                state, action, logprob, _, value = agent.get_action_and_value(
+                    state, next_obs, args.timestep
+                )
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
@@ -268,6 +283,7 @@ if __name__ == "__main__":
         b_obs = obs.reshape((-1,) + env.observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + env.action_space.shape)
+        b_states = states.reshape((-1,) + agent.actor_mean.state_shape)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
@@ -281,8 +297,8 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                    b_obs[mb_inds], b_actions[mb_inds]
+                _, _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                    b_states[mb_inds], b_obs[mb_inds], args.timestep, b_actions[mb_inds]
                 )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
