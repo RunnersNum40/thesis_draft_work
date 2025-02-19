@@ -116,7 +116,7 @@ class Agent(nn.Module):
         )
 
         self.actor_logstd = nn.Parameter(
-            torch.zeros(int(np.prod(env.action_space.shape)))
+            torch.zeros((int(np.prod(env.action_space.shape)),))
         )
 
     def get_value(self, x):
