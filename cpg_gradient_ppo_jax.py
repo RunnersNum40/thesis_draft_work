@@ -35,60 +35,91 @@ logger = logging.getLogger(__name__)
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    """the name of this experiment"""
     seed: int = 1
+    """seed of the experiment"""
+    torch_deterministic: bool = True
+    """if toggled, `torch.backends.cudnn.deterministic=False`"""
+    cuda: bool = True
+    """if toggled, cuda will be enabled by default"""
     capture_video: bool = False
+    """whether to capture videos of the agent performances (check out `videos` folder)"""
+    save_model: bool = False
+    """whether to save model into the `runs/{run_name}` folder"""
 
     # Algorithm specific arguments
-    env_id: str = "CartPole-v1"
-    total_timesteps: int = 500000
-    learning_rate: float = 2.5e-4
-    num_envs: int = 1  # TODO: Implement parallel environments
-    num_steps: int = 128
+    env_id: str = "Ant-v5"
+    """the id of the environment"""
+    total_timesteps: int = 1000000
+    """total timesteps of the experiments"""
+    learning_rate: float = 3e-4
+    """the learning rate of the optimizer"""
+    num_steps: int = 2048
+    """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
+    """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.99
+    """the discount factor gamma"""
     gae_lambda: float = 0.95
-    num_minibatches: int = 4
-    update_epochs: int = 4
+    """the lambda for the general advantage estimation"""
+    num_minibatches: int = 32
+    """the number of mini-batches"""
+    update_epochs: int = 10
+    """the K epochs to update the policy"""
     norm_adv: bool = True
+    """Toggles advantages normalization"""
     clip_coef: float = 0.2
+    """the surrogate clipping coefficient"""
     clip_vloss: bool = True
-    ent_coef: float = 0.01
+    """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
+    ent_coef: float = 0.0
+    """coefficient of the entropy"""
     vf_coef: float = 0.5
+    """coefficient of the value function"""
     max_grad_norm: float = 0.5
+    """the maximum norm for the gradient clipping"""
     target_kl: float | None = None
+    """the target KL divergence threshold"""
+    convergence_factor: float = 1000.0
+    """convergence factor of the CPG model"""
+    num_oscillators: int = 4
+    """number of oscillators in the CPG model"""
+    timestep: float = 1e-2
+    """time increment for CPG steps"""
+    solver: str = "rk4"
+    """ode solver to use with the ODE"""
 
     # to be filled in runtime
     batch_size: int = 0
+    """the batch size (computed in runtime)"""
     minibatch_size: int = 0
+    """the mini-batch size (computed in runtime)"""
     num_iterations: int = 0
+    """the number of iterations (computed in runtime)"""
 
     def __hash__(self):
         return hash(frozenset(vars(self).items()))
 
 
-class DiscreteAgent(nnx.Module):
+class ContinuousAgent(nnx.Module):
     def __init__(self, env: gym.Env, *, rngs: nnx.Rngs) -> None:
         critic_layers = [np.array(env.observation_space.shape).prod(), 64, 64, 1]
         actor_layers = [
-            np.array(env.observation_space.shape).prod(),
+            int(np.array(env.observation_space.shape).prod()),
             64,
             64,
-            env.action_space.n,  # pyright: ignore
+            int(np.array(env.action_space.shape).prod()),
         ]
 
-        self.critic = MLP(critic_layers, nnx.relu, 1.0, rngs=rngs)
+        self.critic = MLP(critic_layers, nnx.tanh, 1.0, rngs=rngs)
         self.actor = MLP(actor_layers, nnx.relu, 0.01, rngs=rngs)
+        self.actor_logstd = nnx.Variable(
+            jnp.zeros(jnp.asarray(env.action_space.shape).prod())
+        )
 
     @nnx.jit
     def get_value(self, x: Array) -> Array:
         return jnp.squeeze(self.critic(x))
-
-    @nnx.jit
-    def get_action(self, x: Array, key: Array | None) -> Array:
-        logits = self.actor(x)
-        if key is None:
-            return jnp.argmax(logits, axis=-1)
-        return random.categorical(key, logits=logits)
 
     @nnx.jit
     def get_action_and_value(
@@ -97,21 +128,28 @@ class DiscreteAgent(nnx.Module):
         key: Array | None,
         action: Array | None = None,
     ) -> tuple[Array, Array, Array, Array]:
-        logits = self.actor(x)
-        if action is None:
-            if key is None:
-                action = jnp.argmax(logits, axis=-1)
-            else:
-                action = random.categorical(key, logits=logits)
+        action_mean = self.actor(x)
+        action_std = jnp.exp(self.actor_logstd.value)
 
-        log_prob = nnx.log_softmax(logits)[action]
-        entropy = -jnp.sum(jnp.exp(log_prob) * log_prob)
-        return action, log_prob, entropy, self.get_value(x)
+        if key is not None:
+            action = action_mean + action_std * random.normal(key, action_mean.shape)
+        else:
+            action = action_mean
+
+        log_prob = jax.scipy.stats.norm.logpdf(
+            action, loc=action_mean, scale=action_std
+        ).sum()
+
+        entropy = 0.5 * (jnp.log(2 * jnp.pi * action_std**2) + 1)
+
+        value = jnp.squeeze(self.critic(x))
+
+        return action, log_prob, entropy, value
 
 
 @nnx.jit(static_argnames=["args"])
 def compute_gae(
-    agent: DiscreteAgent,
+    agent: ContinuousAgent,
     next_observation: Array,
     next_done: Array,
     rewards: Array,
@@ -143,7 +181,7 @@ def compute_gae(
 
 @nnx.jit(static_argnames=["args"])
 def ppo_loss(
-    agent: DiscreteAgent,
+    agent: ContinuousAgent,
     observations: Array,
     actions: Array,
     advantages: Array,
@@ -196,7 +234,7 @@ ppo_grad = nnx.value_and_grad(ppo_loss, has_aux=True)
 
 @nnx.jit(static_argnames=["args"])
 def train_batch(
-    agent: DiscreteAgent,
+    agent: ContinuousAgent,
     optimizer: nnx.Optimizer,
     observations: Array,
     actions: Array,
@@ -221,10 +259,11 @@ def train_batch(
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    args.batch_size = int(args.num_envs * args.num_steps)
+    args.batch_size = args.num_steps
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    logger.info(f"Run name: {run_name}")
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
@@ -234,6 +273,7 @@ if __name__ == "__main__":
 
     np.random.seed(args.seed)
     key = random.key(args.seed)
+    key, flax_rngs = random.split(key)
     flax_rngs = nnx.Rngs(key)
 
     if args.capture_video:
@@ -242,9 +282,10 @@ if __name__ == "__main__":
     else:
         env = gym.make(args.env_id)
     env = gym.wrappers.RecordEpisodeStatistics(env)
-    assert isinstance(env.action_space, gym.spaces.Discrete)
+    assert isinstance(env.action_space, gym.spaces.Box)
+    assert isinstance(env.observation_space, gym.spaces.Box)
 
-    agent = DiscreteAgent(env, rngs=flax_rngs)
+    agent = ContinuousAgent(env, rngs=flax_rngs)
     adam = optax.adam(
         learning_rate=(
             optax.cosine_decay_schedule(args.learning_rate, args.total_timesteps)
@@ -252,20 +293,26 @@ if __name__ == "__main__":
             else args.learning_rate
         )
     )
-    optimizer = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), adam)
-    optimizer = nnx.Optimizer(agent, optimizer)
+    optimizer = nnx.Optimizer(
+        agent, optax.chain(optax.clip_by_global_norm(args.max_grad_norm), adam)
+    )
     observations = jnp.zeros((args.num_steps,) + env.observation_space.shape)
-    actions = jnp.zeros((args.num_steps,), dtype=jnp.int32)
+    actions = jnp.zeros((args.num_steps,) + env.action_space.shape)
     log_probs = jnp.zeros((args.num_steps,))
     rewards = jnp.zeros((args.num_steps,))
     dones = jnp.zeros((args.num_steps,))
     values = jnp.zeros((args.num_steps,))
 
     global_step = 0
-    start_time = time.time()
     next_observation, _ = env.reset(seed=args.seed)
     next_observation = jnp.array(next_observation)
     next_done = jnp.array(0)
+
+    loss = jnp.nan
+    policy_loss = jnp.nan
+    value_loss = jnp.nan
+    entropy_loss = jnp.nan
+    approx_kl = jnp.nan
 
     for iteration in tqdm(range(1, args.num_iterations + 1), desc="Iterations"):
         for step in range(args.num_steps):
@@ -274,21 +321,19 @@ if __name__ == "__main__":
             dones = dones.at[step].set(next_done)
 
             key, subkey = random.split(key)
-            action, log_prob, entropy, value = agent.get_action_and_value(
+            action, log_prob, _, value = agent.get_action_and_value(
                 next_observation, subkey
             )
             values = values.at[step].set(value)
             actions = actions.at[step].set(action)
             log_probs = log_probs.at[step].set(log_prob)
 
-            next_observation, reward, termination, truncation, info = env.step(
-                action.item()
-            )
+            next_observation, reward, termination, truncation, info = env.step(action)
             rewards = rewards.at[step].set(reward)
             next_observation = jnp.array(next_observation)
             next_done = jnp.array(int(termination or truncation))
 
-            if info:
+            if "episode" in info:
                 writer.add_scalar("episode/reward", info["episode"]["r"], global_step)
                 writer.add_scalar("episode/length", info["episode"]["l"], global_step)
                 writer.add_scalar("episode/time", info["episode"]["t"], global_step)
