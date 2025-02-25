@@ -86,6 +86,20 @@ class MLP(nnx.Module):
 
 
 class CPG(nnx.Module):
+    """Central Pattern Generator (CPG) model.
+
+    Based on the amplitude controlled phase oscillator model described in:
+    @misc{bellegarda2022cpgrllearningcentralpattern,
+        title={CPG-RL: Learning Central Pattern Generators for Quadruped Locomotion},
+        author={Guillaume Bellegarda and Auke Ijspeert},
+        year={2022},
+        eprint={2211.00458},
+        archivePrefix={arXiv},
+        primaryClass={cs.RO},
+        url={https://arxiv.org/abs/2211.00458},
+    }
+    """
+
     def __init__(self, num_oscillators: int, convergence_factor: float) -> None:
         self.num_oscillators = num_oscillators
         self.convergence_factor = convergence_factor
