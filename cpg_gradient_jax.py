@@ -162,7 +162,11 @@ class CPGNetwork(nnx.Module):
     ) -> tuple[Array, Array]:
         term = diffrax.ODETerm(self.cpg)  # pyright: ignore
         solver = self.solver()
-        stepsize_controller = diffrax.PIDController(rtol=1e-5, atol=1e-5)
+        stepsize_controller = (
+            diffrax.PIDController(rtol=1e-5, atol=1e-5)
+            if isinstance(solver, diffrax.AbstractAdaptiveSolver)
+            else diffrax.ConstantStepSize()
+        )
         ts = [time, time + timestep]
         saveat = diffrax.SaveAt(ts=ts)
 
