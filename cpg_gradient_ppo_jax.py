@@ -11,10 +11,9 @@ import numpy as np
 import optax
 import tyro
 from flax import nnx
-from jax import Array, random
-from torch.utils.tensorboard import SummaryWriter
-from tqdm import TqdmExperimentalWarning
-from tqdm.rich import tqdm
+from jax import Array, jr
+from torch.utils.tensorboard import SummaryWriter  # pyright: ignore
+from tqdm import TqdmExperimentalWarning, trange
 
 from cpg_gradient_jax import MLP, CPGNetwork
 
@@ -131,10 +130,11 @@ class ContinuousAgent(nnx.Module):
         action_mean = self.actor(x)
         action_std = jnp.exp(self.actor_logstd.value)
 
-        if key is not None:
-            action = action_mean + action_std * random.normal(key, action_mean.shape)
-        else:
-            action = action_mean
+        if action is None:
+            if key is not None:
+                action = action_mean + action_std * jr.normal(key, action_mean.shape)
+            else:
+                action = action_mean
 
         log_prob = jax.scipy.stats.norm.logpdf(
             action, loc=action_mean, scale=action_std
@@ -158,22 +158,29 @@ def compute_gae(
     args: Args,
 ) -> tuple[Array, Array]:
     next_value = agent.get_value(next_observation)
-    advantages = jnp.zeros_like(rewards)
-    last_gae_lambda = 0
-    for t in reversed(range(args.num_steps)):
-        if t == args.num_steps - 1:
-            next_non_terminal = 1.0 - next_done
-            next_values = next_value
-        else:
-            next_non_terminal = 1.0 - dones[t + 1]
-            next_values = values[t + 1]
 
-        delta = rewards[t] + args.gamma * next_values * next_non_terminal - values[t]
-        last_gae_lambda = (
-            delta + args.gamma * args.gae_lambda * last_gae_lambda * next_non_terminal
-        )
-        advantages = advantages.at[t].set(last_gae_lambda)
+    next_values = jnp.concatenate([values[1:], next_value[None]], axis=0)
+    next_non_terminal = jnp.concatenate(
+        [1.0 - dones[1:], jnp.array([1.0 - next_done], dtype=rewards.dtype)], axis=0
+    )
 
+    def scan_fn(carry, x):
+        reward, value, next_val, non_terminal = x
+        delta = reward + args.gamma * next_val * non_terminal - value
+        new_carry = delta + args.gamma * args.gae_lambda * non_terminal * carry
+        return new_carry, new_carry
+
+    inputs = (
+        jnp.flip(rewards, axis=0),
+        jnp.flip(values, axis=0),
+        jnp.flip(next_values, axis=0),
+        jnp.flip(next_non_terminal, axis=0),
+    )
+    inputs_stacked = jnp.stack(inputs, axis=1)
+    init_carry = jnp.array(0.0, dtype=rewards.dtype)
+    _, advantages_rev = jax.lax.scan(scan_fn, init_carry, inputs_stacked)
+
+    advantages = jnp.flip(advantages_rev, axis=0)
     returns = advantages + values
 
     return advantages, returns
@@ -271,9 +278,9 @@ if __name__ == "__main__":
         % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    np.random.seed(args.seed)
-    key = random.key(args.seed)
-    key, flax_rngs = random.split(key)
+    np.jr.seed(args.seed)
+    key = jr.key(args.seed)
+    key, flax_rngs = jr.split(key)
     flax_rngs = nnx.Rngs(key)
 
     if args.capture_video:
@@ -305,7 +312,7 @@ if __name__ == "__main__":
 
     global_step = 0
     next_observation, _ = env.reset(seed=args.seed)
-    next_observation = jnp.array(next_observation)
+    next_observation = jnp.asarray(next_observation)
     next_done = jnp.array(0)
 
     loss = jnp.nan
@@ -314,13 +321,13 @@ if __name__ == "__main__":
     entropy_loss = jnp.nan
     approx_kl = jnp.nan
 
-    for iteration in tqdm(range(1, args.num_iterations + 1), desc="Iterations"):
-        for step in range(args.num_steps):
+    for iteration in trange(1, args.num_iterations + 1, desc="Iterations"):
+        for step in trange(args.num_steps, leave=False, desc="Steps"):
             global_step += 1
             observations = observations.at[step].set(next_observation)
             dones = dones.at[step].set(next_done)
 
-            key, subkey = random.split(key)
+            key, subkey = jr.split(key)
             action, log_prob, _, value = agent.get_action_and_value(
                 next_observation, subkey
             )
@@ -330,8 +337,8 @@ if __name__ == "__main__":
 
             next_observation, reward, termination, truncation, info = env.step(action)
             rewards = rewards.at[step].set(reward)
-            next_observation = jnp.array(next_observation)
-            next_done = jnp.array(int(termination or truncation))
+            next_observation = jnp.asarray(next_observation)
+            next_done = jnp.asarray(int(termination or truncation))
 
             if "episode" in info:
                 writer.add_scalar("episode/reward", info["episode"]["r"], global_step)
@@ -346,11 +353,9 @@ if __name__ == "__main__":
             agent, next_observation, next_done, rewards, values, dones, args
         )
 
-        for epoch in range(args.update_epochs):
-            key, subkey = random.split(key)
-            batch_indices = random.permutation(
-                subkey, args.batch_size, independent=True
-            )
+        for epoch in trange(args.update_epochs, leave=False, desc="Epochs"):
+            key, subkey = jr.split(key)
+            batch_indices = jr.permutation(subkey, args.batch_size, independent=True)
             for start in range(0, args.batch_size, args.minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = batch_indices[start:end]

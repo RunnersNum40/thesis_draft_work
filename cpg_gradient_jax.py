@@ -106,10 +106,10 @@ class CPG(nnx.Module):
         self.state_shape = (3 * num_oscillators,)
         self.param_shape = (2 * (num_oscillators + num_oscillators**2),)
 
-    def __call__(self, t: float, state: ArrayLike, args: ArrayLike) -> Array:
+    def __call__(self, t: float, state: ArrayLike, params: ArrayLike) -> Array:
         amplitudes, phases, amplitudes_dot = split_states(state, self.num_oscillators)
         intrinsic_amplitudes, intrinsic_frequencies, coupling_weights, phase_biases = (
-            split_params(args, self.num_oscillators)
+            split_params(params, self.num_oscillators)
         )
 
         phase_diffs = jnp.subtract.outer(phases, phases) - phase_biases
@@ -126,6 +126,17 @@ class CPG(nnx.Module):
         return jnp.concatenate([amplitudes_dot, phase_dot, amplitudes_dot_dot])
 
 
+class CPGLayer(nnx.Module):
+    def __init__(self, input_network: MLP, cpg: CPG) -> None:
+        self.input_network = input_network
+        self.cpg = cpg
+
+    def __call__(self, t: float, state: ArrayLike, x: ArrayLike) -> Array:
+        x = jnp.concatenate([jnp.array([t]), state, x])
+        params = nnx.tanh(self.input_network(x))
+        return self.cpg(t, state, params)
+
+
 class CPGNetwork(nnx.Module):
     final_input_layer_kernel_scale: float = 1.0
     final_output_layer_kernel_scale: float = 0.01
@@ -136,31 +147,37 @@ class CPGNetwork(nnx.Module):
         convergence_factor: float,
         input_layers: list[int],
         output_layers: list[int],
-        solver: type[diffrax.AbstractSolver] = diffrax.Dopri5,
+        solver: type[diffrax.AbstractSolver] = diffrax.Tsit5,
         *,
         rngs: nnx.Rngs,
     ) -> None:
         self.num_oscillators = num_oscillators
         self.solver = solver
 
-        self.cpg = CPG(num_oscillators, convergence_factor)
+        cpg = CPG(num_oscillators, convergence_factor)
 
         input_layers[0] += 1  # time input
         input_layers[0] += 3 * num_oscillators  # state input
-        input_layers.append(self.cpg.param_shape[0])  # params
-        self.input_network = MLP(
-            input_layers, nnx.relu, self.final_input_layer_kernel_scale, rngs=rngs
+        input_layers.append(cpg.param_shape[0])  # params
+        input_network = MLP(
+            input_layers, nnx.silu, self.final_input_layer_kernel_scale, rngs=rngs
         )
+        self.cpg_layer = CPGLayer(input_network, cpg)
 
         output_layers.insert(0, num_oscillators * 2)  # state
-        self.output_network = MLP(
+        self.output_map = MLP(
             output_layers, nnx.relu, self.final_output_layer_kernel_scale, rngs=rngs
         )
 
     def __call__(
-        self, state: ArrayLike, x: ArrayLike, time: float, timestep: float
-    ) -> tuple[Array, Array]:
-        term = diffrax.ODETerm(self.cpg)  # pyright: ignore
+        self,
+        state: ArrayLike,
+        x: ArrayLike,
+        time: float,
+        timestep: float,
+        map_output: bool = False,
+    ) -> tuple[Array, Array | None]:
+        term = diffrax.ODETerm(self.cpg_layer)  # pyright: ignore
         solver = self.solver()
         stepsize_controller = (
             diffrax.PIDController(rtol=1e-5, atol=1e-5)
@@ -169,9 +186,6 @@ class CPGNetwork(nnx.Module):
         )
         ts = [time, time + timestep]
         saveat = diffrax.SaveAt(ts=ts)
-
-        x = jnp.concatenate([jnp.asarray([time]), state, x])
-        params = nnx.tanh(self.input_network(x))
 
         solution = diffrax.diffeqsolve(
             terms=term,
@@ -182,24 +196,24 @@ class CPGNetwork(nnx.Module):
             y0=state,
             stepsize_controller=stepsize_controller,
             saveat=saveat,
-            args=params,
+            args=x,
         )
-
         assert solution.ys is not None
-
         state = jnp.asarray(solution.ys[0])
 
-        amplitudes, phases, _ = split_states(state, self.num_oscillators)
-        cpg_output = jnp.concatenate(
-            [amplitudes * jnp.sin(phases), amplitudes * jnp.cos(phases)]
-        )
+        if map_output:
+            amplitudes, phases, _ = split_states(state, self.num_oscillators)
+            cpg_output = jnp.concatenate(
+                [amplitudes * jnp.sin(phases), amplitudes * jnp.cos(phases)]
+            )
+            return state, self.output_map(cpg_output)
 
-        return state, self.output_network(cpg_output)
+        return state, None
 
     @property
     def state_shape(self) -> tuple[int]:
-        return self.cpg.state_shape
+        return self.cpg_layer.cpg.state_shape
 
     @property
     def param_size(self) -> tuple[int]:
-        return self.cpg.param_shape
+        return self.cpg_layer.cpg.param_shape
