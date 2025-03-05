@@ -2,7 +2,6 @@ import os
 import random
 import time
 from dataclasses import dataclass
-from typing import Generator
 
 import equinox as eqx
 import gymnasium as gym
@@ -35,7 +34,7 @@ class Args:
 
     env_id: str = "InvertedPendulum-v5"
     """the id of the environment"""
-    total_timesteps: int = 100000
+    total_timesteps: int = 1000000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
@@ -424,15 +423,7 @@ if __name__ == "__main__":
         env = gym.make(args.env_id)
     env = gym.wrappers.FlattenObservation(env)
     env = gym.wrappers.RecordEpisodeStatistics(env)
-    env = gym.wrappers.ClipAction(env)
-    env = gym.wrappers.NormalizeObservation(env)
-    env = gym.wrappers.TransformObservation(
-        env, lambda obs: np.clip(obs, -10, 10), env.observation_space
-    )
     env = gym.wrappers.NormalizeReward(env, gamma=args.gamma)
-    env = gym.wrappers.TransformReward(
-        env, lambda reward: np.clip(float(reward), -10, 10)
-    )
     assert isinstance(
         env.observation_space, gym.spaces.Box
     ), "only continuous observation space is supported"
@@ -460,7 +451,7 @@ if __name__ == "__main__":
     values = jnp.zeros((args.num_steps,))
 
     global_step = 0
-    next_observation, _ = env.reset(seed=args.seed)
+    next_observation, _ = env.reset(seed=random.randint(0, 2**32 - 1))
     next_observation = jnp.asarray(next_observation)
     next_done = jnp.array(0)
 
@@ -489,7 +480,7 @@ if __name__ == "__main__":
                 writer.add_scalar("episode/time", info["episode"]["t"], global_step)
 
             if termination or truncation:
-                next_observation, _ = env.reset(seed=args.seed)
+                next_observation, _ = env.reset(seed=random.randint(0, 2**32 - 1))
                 next_observation = jnp.array(next_observation)
 
         advantages, returns = compute_gae(
