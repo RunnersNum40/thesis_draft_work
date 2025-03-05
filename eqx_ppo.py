@@ -2,6 +2,7 @@ import os
 import random
 import time
 from dataclasses import dataclass
+from typing import Generator
 
 import equinox as eqx
 import gymnasium as gym
@@ -12,7 +13,7 @@ import tyro
 from jax import Array
 from jax import numpy as jnp
 from jax import random as jr
-from torch.utils.tensorboard import SummaryWriter
+from torch.utils.tensorboard.writer import SummaryWriter
 
 from tqdm_rich_without_warnings import trange
 
@@ -179,6 +180,7 @@ def compute_gae(
     return advantages, returns
 
 
+@eqx.filter_jit
 @eqx.filter_value_and_grad(has_aux=True)
 def loss_grad(
     agent: Agent,
@@ -263,6 +265,139 @@ def train_batch(
     )
 
 
+@eqx.filter_jit
+def get_batches(batch_size: int, data_size: int, key: Array) -> jnp.ndarray:
+    perm = jr.permutation(key, data_size, independent=True)
+    num_batches = data_size // batch_size
+    return perm[: num_batches * batch_size].reshape(num_batches, batch_size)
+
+
+def train_on_minibatch(
+    agent: Agent,
+    opt_state: optax.OptState,
+    optimizer: optax.GradientTransformation,
+    key: Array,
+    observations: Array,
+    actions: Array,
+    advantages: Array,
+    returns: Array,
+    values: Array,
+    log_probs: Array,
+    args: Args,
+) -> tuple[Array, Array, Array, Array, Array, Agent, optax.OptState]:
+    losses = []
+    policy_losses = []
+    value_losses = []
+    entropy_losses = []
+    approx_kls = []
+    for batch_indices in get_batches(args.minibatch_size, args.num_steps, key):
+        (
+            loss,
+            policy_loss,
+            value_loss,
+            entropy_loss,
+            approx_kl,
+            agent,
+            opt_state,
+        ) = train_batch(
+            agent,
+            opt_state,
+            optimizer,
+            observations[batch_indices],
+            actions[batch_indices],
+            advantages[batch_indices],
+            returns[batch_indices],
+            values[batch_indices],
+            log_probs[batch_indices],
+            args,
+        )
+        losses.append(loss)
+        policy_losses.append(policy_loss)
+        value_losses.append(value_loss)
+        entropy_losses.append(entropy_loss)
+        approx_kls.append(approx_kl)
+
+    loss = jnp.asarray(losses).mean()
+    policy_loss = jnp.asarray(policy_losses).mean()
+    value_loss = jnp.asarray(value_losses).mean()
+    entropy_loss = jnp.asarray(entropy_losses).mean()
+    approx_kl = jnp.asarray(approx_kls).mean()
+
+    return loss, policy_loss, value_loss, entropy_loss, approx_kl, agent, opt_state
+
+
+def update_step(
+    agent: Agent,
+    opt_state: optax.OptState,
+    optimizer: optax.GradientTransformation,
+    key: Array,
+    observations: Array,
+    actions: Array,
+    advantages: Array,
+    returns: Array,
+    values: Array,
+    log_probs: Array,
+    args: Args,
+) -> tuple[Agent, optax.OptState, Array, Array, Array, Array, Array, Array]:
+    losses = []
+    policy_losses = []
+    value_losses = []
+    entropy_losses = []
+    approx_kls = []
+
+    for _ in range(args.update_epochs):
+        key, batch_key = jr.split(key)
+        (
+            loss,
+            policy_loss,
+            value_loss,
+            entropy_loss,
+            approx_kl,
+            agent,
+            opt_state,
+        ) = train_on_minibatch(
+            agent,
+            opt_state,
+            optimizer,
+            batch_key,
+            observations,
+            actions,
+            advantages,
+            returns,
+            values,
+            log_probs,
+            args,
+        )
+        losses.append(loss)
+        policy_losses.append(policy_loss)
+        value_losses.append(value_loss)
+        entropy_losses.append(entropy_loss)
+        approx_kls.append(approx_kl)
+
+    loss = jnp.asarray(losses).mean()
+    policy_loss = jnp.asarray(policy_losses).mean()
+    value_loss = jnp.asarray(value_losses).mean()
+    entropy_loss = jnp.asarray(entropy_losses).mean()
+    approx_kl = jnp.asarray(approx_kls).mean()
+
+    variance = jnp.var(returns)
+    if variance == 0:
+        explained_variance = jnp.array(0.0)
+    else:
+        explained_variance = 1 - jnp.var(returns - values) / variance
+
+    return (
+        agent,
+        opt_state,
+        loss,
+        policy_loss,
+        value_loss,
+        entropy_loss,
+        approx_kl,
+        explained_variance,
+    )
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_steps)
@@ -329,12 +464,6 @@ if __name__ == "__main__":
     next_observation = jnp.asarray(next_observation)
     next_done = jnp.array(0)
 
-    loss = jnp.nan
-    policy_loss = jnp.nan
-    value_loss = jnp.nan
-    entropy_loss = jnp.nan
-    approx_kl = jnp.nan
-
     for iteration in trange(1, args.num_iterations + 1):
         for step in range(args.num_steps):
             global_step += 1
@@ -367,37 +496,28 @@ if __name__ == "__main__":
             agent, next_observation, next_done, rewards, values, dones, args
         )
 
-        for epoch in range(args.update_epochs):
-            key, batch_key = jr.split(key)
-            batch_indices = jr.permutation(batch_key, args.num_steps, independent=True)
-            for start in range(0, args.num_steps, args.minibatch_size):
-                end = start + args.minibatch_size
-                minibatch_idx = batch_indices[start:end]
-
-                (
-                    loss,
-                    policy_loss,
-                    value_loss,
-                    entropy_loss,
-                    approx_kl,
-                    agent,
-                    opt_state,
-                ) = train_batch(
-                    agent,
-                    opt_state,
-                    optimizer,
-                    observations[minibatch_idx],
-                    actions[minibatch_idx],
-                    advantages[minibatch_idx],
-                    returns[minibatch_idx],
-                    values[minibatch_idx],
-                    log_probs[minibatch_idx],
-                    args,
-                )
-
-        variance = jnp.var(returns)
-        explained_variance = (
-            jnp.nan if variance == 0 else 1 - jnp.var(values - returns) / variance
+        key, iteration_key = jr.split(key)
+        (
+            agent,
+            opt_state,
+            loss,
+            policy_loss,
+            value_loss,
+            entropy_loss,
+            approx_kl,
+            explained_variance,
+        ) = update_step(
+            agent,
+            opt_state,
+            optimizer,
+            iteration_key,
+            observations,
+            actions,
+            advantages,
+            returns,
+            values,
+            log_probs,
+            args,
         )
 
         writer.add_scalar("loss/total", float(loss), global_step)
