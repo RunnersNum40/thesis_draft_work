@@ -14,6 +14,7 @@ from jax import numpy as jnp
 from jax import random as jr
 from torch.utils.tensorboard.writer import SummaryWriter
 
+from cpg_eqx import NeuralCPG
 from tqdm_rich_without_warnings import trange
 
 
@@ -66,6 +67,8 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float | None = None
     """the target KL divergence threshold"""
+    timestep: float = 1e-3
+    """timestep of the Neural CPG model"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -81,7 +84,7 @@ class Args:
 
 class Agent(eqx.Module):
     critic: eqx.nn.MLP
-    actor_mean: eqx.nn.MLP
+    actor_mean: NeuralCPG
     actor_logstd: Array
 
     def __init__(self, env: gym.Env, *, key: Array, **kwargs):
@@ -95,16 +98,19 @@ class Agent(eqx.Module):
             in_size=int(jnp.asarray(env.observation_space.shape).prod()),
             out_size=1,
             width_size=64,
-            depth=3,
+            depth=2,
             activation=jax.nn.tanh,
             key=critic_key,
         )
-        self.actor_mean = eqx.nn.MLP(
-            in_size=int(jnp.asarray(env.observation_space.shape).prod()),
-            out_size=int(jnp.asarray(env.action_space.shape).prod()),
-            width_size=64,
-            depth=3,
-            activation=jax.nn.tanh,
+        self.actor_mean = NeuralCPG(
+            1,
+            100.0,
+            input_size=int(jnp.asarray(env.observation_space.shape).prod()),
+            input_mapping_width=64,
+            input_mapping_depth=2,
+            output_size=int(jnp.asarray(env.action_space.shape).prod()),
+            output_mapping_width=64,
+            output_mapping_depth=2,
             key=actor_mean_key,
         )
         self.actor_logstd = jnp.zeros(jnp.asarray(env.action_space.shape).prod())
@@ -115,15 +121,25 @@ class Agent(eqx.Module):
 
     @eqx.filter_jit
     def get_action_and_value(
-        self, x: Array, key: Array
-    ) -> tuple[Array, Array, Array, Array]:
-        action_mean = self.actor_mean(x)
+        self, x: Array, state: Array, ts: Array, key: Array
+    ) -> tuple[Array, Array, Array, Array, Array]:
+        assert ts.shape == (2,)
+        assert (
+            state.shape == self.actor_mean.state_shape
+        ), f"{state.shape=}, {self.actor_mean.state_shape=}"
+
+        state, action_mean = self.actor_mean(
+            ts, state, x, map_output=True, max_solver_steps=2**14
+        )
+        assert action_mean is not None
+
         action_std = jnp.exp(self.actor_logstd)
         action = jr.normal(key, action_mean.shape) * action_std + action_mean
         logprob = jax.scipy.stats.norm.logpdf(action, action_mean, action_std)
         entropy = 0.5 * (jnp.log(2 * jnp.pi * action_std**2) + 1)
 
         return (
+            state,
             action,
             logprob.sum(),
             entropy.sum(),
@@ -131,8 +147,17 @@ class Agent(eqx.Module):
         )
 
     @eqx.filter_jit
-    def get_action_value(self, x: Array, action: Array) -> tuple[Array, Array, Array]:
-        action_mean = self.actor_mean(x)
+    def get_action_value(
+        self, x: Array, state: Array, ts: Array, action: Array
+    ) -> tuple[Array, Array, Array]:
+        assert ts.shape == (2,)
+        assert state.shape == self.actor_mean.state_shape
+
+        state, action_mean = self.actor_mean(
+            ts, state, x, map_output=True, max_solver_steps=2**14
+        )
+        assert action_mean is not None
+
         action_std = jnp.exp(self.actor_logstd)
         logprob = jax.scipy.stats.norm.logpdf(action, action_mean, action_std)
         entropy = 0.5 * (jnp.log(2 * jnp.pi * action_std**2) + 1)
@@ -184,6 +209,8 @@ def compute_gae(
 def loss_grad(
     agent: Agent,
     observations: Array,
+    states: Array,
+    times: Array,
     actions: Array,
     advantages: Array,
     returns: Array,
@@ -192,7 +219,7 @@ def loss_grad(
     args: Args,
 ) -> tuple[Array, tuple[Array, Array, Array, Array]]:
     new_log_prob, entropy, new_value = jax.vmap(agent.get_action_value)(
-        observations, actions
+        observations, states, times, actions
     )
     log_ratio = new_log_prob - log_probs
     ratio = jnp.exp(log_ratio)
@@ -236,6 +263,8 @@ def train_batch(
     opt_state: optax.OptState,
     optimizer: optax.GradientTransformation,
     observations: Array,
+    states: Array,
+    times: Array,
     actions: Array,
     advantages: Array,
     returns: Array,
@@ -243,13 +272,33 @@ def train_batch(
     log_probs: Array,
     args: Args,
 ) -> tuple[Array, Array, Array, Array, Array, Agent, optax.OptState]:
-    observations, actions, advantages, returns, values, log_probs = jax.tree.map(
-        jax.lax.stop_gradient,
-        (observations, actions, advantages, returns, values, log_probs),
+    observations, states, times, actions, advantages, returns, values, log_probs = (
+        jax.tree.map(
+            jax.lax.stop_gradient,
+            (
+                observations,
+                states,
+                times,
+                actions,
+                advantages,
+                returns,
+                values,
+                log_probs,
+            ),
+        )
     )
 
     (loss, (policy_loss, value_loss, entropy_loss, approx_kl)), grads = loss_grad(
-        agent, observations, actions, advantages, returns, values, log_probs, args
+        agent,
+        observations,
+        states,
+        times,
+        actions,
+        advantages,
+        returns,
+        values,
+        log_probs,
+        args,
     )
     updates, new_opt_state = optimizer.update(grads, opt_state)
     new_agent = eqx.apply_updates(agent, updates)
@@ -277,6 +326,8 @@ def train_on_minibatch(
     optimizer: optax.GradientTransformation,
     key: Array,
     observations: Array,
+    states: Array,
+    times: Array,
     actions: Array,
     advantages: Array,
     returns: Array,
@@ -303,6 +354,8 @@ def train_on_minibatch(
             opt_state,
             optimizer,
             observations[batch_indices],
+            states[batch_indices],
+            times[batch_indices],
             actions[batch_indices],
             advantages[batch_indices],
             returns[batch_indices],
@@ -331,6 +384,8 @@ def update_step(
     optimizer: optax.GradientTransformation,
     key: Array,
     observations: Array,
+    states: Array,
+    times: Array,
     actions: Array,
     advantages: Array,
     returns: Array,
@@ -360,6 +415,8 @@ def update_step(
             optimizer,
             batch_key,
             observations,
+            states,
+            times,
             actions,
             advantages,
             returns,
@@ -423,6 +480,8 @@ if __name__ == "__main__":
         env = gym.make(args.env_id)
     env = gym.wrappers.FlattenObservation(env)
     env = gym.wrappers.RecordEpisodeStatistics(env)
+    env = gym.wrappers.ClipAction(env)
+    env = gym.wrappers.NormalizeObservation(env)
     env = gym.wrappers.NormalizeReward(env, gamma=args.gamma)
     assert isinstance(
         env.observation_space, gym.spaces.Box
@@ -435,15 +494,18 @@ if __name__ == "__main__":
     agent = Agent(env, key=agent_key)
     if args.anneal_lr:
         schedule = optax.schedules.cosine_decay_schedule(
-            args.learning_rate, args.total_timesteps
+            args.learning_rate,
+            args.num_iterations * args.update_epochs * args.num_minibatches,
         )
     else:
         schedule = optax.constant_schedule(args.learning_rate)
-    adam = optax.adam(learning_rate=schedule)
+    adam = optax.inject_hyperparams(optax.adam)(learning_rate=schedule)
     optimizer = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), adam)
     opt_state = optimizer.init(eqx.filter(agent, eqx.is_inexact_array))
 
     observations = jnp.zeros((args.num_steps,) + env.observation_space.shape)
+    states = jnp.zeros((args.num_steps,) + agent.actor_mean.state_shape)
+    times = jnp.zeros((args.num_steps, 2))
     actions = jnp.zeros((args.num_steps,) + env.action_space.shape)
     log_probs = jnp.zeros((args.num_steps,))
     rewards = jnp.zeros((args.num_steps,))
@@ -451,19 +513,27 @@ if __name__ == "__main__":
     values = jnp.zeros((args.num_steps,))
 
     global_step = 0
+    next_done = jnp.array(0)
+
     next_observation, _ = env.reset(seed=random.randint(0, 2**32 - 1))
     next_observation = jnp.asarray(next_observation)
-    next_done = jnp.array(0)
+    key, state_key = jr.split(key)
+    model_state = jr.normal(state_key, agent.actor_mean.state_shape)
+    model_time = jnp.array(0.0)
 
     for iteration in trange(1, args.num_iterations + 1):
         for step in range(args.num_steps):
             global_step += 1
+
+            ts = jnp.array([model_time, model_time + args.timestep])
             observations = observations.at[step].set(next_observation)
+            states = states.at[step].set(model_state)
+            times = times.at[step].set(ts)
             dones = dones.at[step].set(next_done)
 
             key, subkey = jr.split(key)
-            action, log_prob, _, value = agent.get_action_and_value(
-                next_observation, subkey
+            model_state, action, log_prob, _, value = agent.get_action_and_value(
+                next_observation, model_state, ts, subkey
             )
             values = values.at[step].set(value)
             actions = actions.at[step].set(action)
@@ -482,6 +552,9 @@ if __name__ == "__main__":
             if termination or truncation:
                 next_observation, _ = env.reset(seed=random.randint(0, 2**32 - 1))
                 next_observation = jnp.array(next_observation)
+                key, state_key = jr.split(key)
+                model_state = jr.normal(state_key, agent.actor_mean.state_shape)
+                model_time = jnp.array(0.0)
 
         advantages, returns = compute_gae(
             agent, next_observation, next_done, rewards, values, dones, args
@@ -498,17 +571,19 @@ if __name__ == "__main__":
             approx_kl,
             explained_variance,
         ) = update_step(
-            agent,
-            opt_state,
-            optimizer,
-            iteration_key,
-            observations,
-            actions,
-            advantages,
-            returns,
-            values,
-            log_probs,
-            args,
+            agent=agent,
+            opt_state=opt_state,
+            optimizer=optimizer,
+            key=iteration_key,
+            observations=observations,
+            states=states,
+            times=times,
+            actions=actions,
+            advantages=advantages,
+            returns=returns,
+            values=values,
+            log_probs=log_probs,
+            args=args,
         )
 
         writer.add_scalar("loss/total", float(loss), global_step)
@@ -518,6 +593,11 @@ if __name__ == "__main__":
         writer.add_scalar("loss/kl", float(approx_kl), global_step)
         writer.add_scalar(
             "loss/explained_variance", float(explained_variance), global_step
+        )
+        writer.add_scalar(
+            "loss/learning_rate",
+            float(opt_state[1].hyperparams["learning_rate"]),  # pyright: ignore
+            global_step,
         )
 
     env.close()

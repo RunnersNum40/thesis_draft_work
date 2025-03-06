@@ -226,14 +226,20 @@ class NeuralCPG(eqx.Module):
         )
 
     def __call__(
-        self, ts: Array, y0: Array, x: ArrayLike, map_output: bool = False
+        self,
+        ts: Array,
+        y0: Array,
+        x: ArrayLike,
+        *,
+        map_output: bool = False,
+        max_solver_steps: int = 2**10,
     ) -> tuple[Array, Array | None]:
         term = diffrax.ODETerm(self.vector_field)  # pyright: ignore
         solver = diffrax.Heun()
         t0 = ts[0]
         t1 = ts[-1]
         dt0 = ts[1] - ts[0]
-        stepsize_controller = diffrax.PIDController(rtol=1e-4, atol=1e-4)
+        # stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-6)
         saveat = diffrax.SaveAt(t1=True)
 
         solution = diffrax.diffeqsolve(
@@ -243,9 +249,10 @@ class NeuralCPG(eqx.Module):
             t1=t1,
             dt0=dt0,
             y0=y0,
-            stepsize_controller=stepsize_controller,
+            # stepsize_controller=stepsize_controller,
             saveat=saveat,
             args=x,
+            max_steps=max_solver_steps,
         )
 
         assert solution.ys is not None
@@ -255,3 +262,15 @@ class NeuralCPG(eqx.Module):
             return state, self.output_mapping(state)
 
         return state, None
+
+    @property
+    def state_shape(self) -> tuple[int]:
+        return (self.vector_field.state_shape,)
+
+    @property
+    def param_shape(self) -> tuple[int]:
+        return (self.vector_field.param_shape,)
+
+    @property
+    def output_shape(self) -> tuple[int]:
+        return (self.output_mapping.output_shape,)
