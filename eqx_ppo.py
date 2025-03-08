@@ -272,22 +272,6 @@ def train_batch(
     log_probs: Array,
     args: Args,
 ) -> tuple[Array, Array, Array, Array, Array, Agent, optax.OptState]:
-    observations, states, times, actions, advantages, returns, values, log_probs = (
-        jax.tree.map(
-            jax.lax.stop_gradient,
-            (
-                observations,
-                states,
-                times,
-                actions,
-                advantages,
-                returns,
-                values,
-                log_probs,
-            ),
-        )
-    )
-
     (loss, (policy_loss, value_loss, entropy_loss, approx_kl)), grads = loss_grad(
         agent,
         observations,
@@ -335,12 +319,15 @@ def train_on_minibatch(
     log_probs: Array,
     args: Args,
 ) -> tuple[Array, Array, Array, Array, Array, Agent, optax.OptState]:
-    losses = []
-    policy_losses = []
-    value_losses = []
-    entropy_losses = []
-    approx_kls = []
-    for batch_indices in get_batches(args.minibatch_size, args.num_steps, key):
+    losses = jnp.zeros(args.num_minibatches)
+    policy_losses = jnp.zeros(args.num_minibatches)
+    value_losses = jnp.zeros(args.num_minibatches)
+    entropy_losses = jnp.zeros(args.num_minibatches)
+    approx_kls = jnp.zeros(args.num_minibatches)
+
+    for i, batch_indices in enumerate(
+        get_batches(args.minibatch_size, args.num_steps, key)
+    ):
         (
             loss,
             policy_loss,
@@ -363,17 +350,18 @@ def train_on_minibatch(
             log_probs[batch_indices],
             args,
         )
-        losses.append(loss)
-        policy_losses.append(policy_loss)
-        value_losses.append(value_loss)
-        entropy_losses.append(entropy_loss)
-        approx_kls.append(approx_kl)
 
-    loss = jnp.asarray(losses).mean()
-    policy_loss = jnp.asarray(policy_losses).mean()
-    value_loss = jnp.asarray(value_losses).mean()
-    entropy_loss = jnp.asarray(entropy_losses).mean()
-    approx_kl = jnp.asarray(approx_kls).mean()
+        losses = losses.at[i].set(loss)
+        policy_losses = policy_losses.at[i].set(policy_loss)
+        value_losses = value_losses.at[i].set(value_loss)
+        entropy_losses = entropy_losses.at[i].set(entropy_loss)
+        approx_kls = approx_kls.at[i].set(approx_kl)
+
+    loss = losses.mean()
+    policy_loss = policy_losses.mean()
+    value_loss = value_losses.mean()
+    entropy_loss = entropy_losses.mean()
+    approx_kl = approx_kls.mean()
 
     return loss, policy_loss, value_loss, entropy_loss, approx_kl, agent, opt_state
 
@@ -393,13 +381,29 @@ def update_step(
     log_probs: Array,
     args: Args,
 ) -> tuple[Agent, optax.OptState, Array, Array, Array, Array, Array, Array]:
-    losses = []
-    policy_losses = []
-    value_losses = []
-    entropy_losses = []
-    approx_kls = []
+    observations, states, times, actions, advantages, returns, values, log_probs = (
+        jax.tree.map(
+            jax.lax.stop_gradient,
+            (
+                observations,
+                states,
+                times,
+                actions,
+                advantages,
+                returns,
+                values,
+                log_probs,
+            ),
+        )
+    )
 
-    for _ in range(args.update_epochs):
+    losses = jnp.zeros(args.update_epochs)
+    policy_losses = jnp.zeros(args.update_epochs)
+    value_losses = jnp.zeros(args.update_epochs)
+    entropy_losses = jnp.zeros(args.update_epochs)
+    approx_kls = jnp.zeros(args.update_epochs)
+
+    for i in range(args.update_epochs):
         key, batch_key = jr.split(key)
         (
             loss,
@@ -424,17 +428,18 @@ def update_step(
             log_probs,
             args,
         )
-        losses.append(loss)
-        policy_losses.append(policy_loss)
-        value_losses.append(value_loss)
-        entropy_losses.append(entropy_loss)
-        approx_kls.append(approx_kl)
 
-    loss = jnp.asarray(losses).mean()
-    policy_loss = jnp.asarray(policy_losses).mean()
-    value_loss = jnp.asarray(value_losses).mean()
-    entropy_loss = jnp.asarray(entropy_losses).mean()
-    approx_kl = jnp.asarray(approx_kls).mean()
+        losses = losses.at[i].set(loss)
+        policy_losses = policy_losses.at[i].set(policy_loss)
+        value_losses = value_losses.at[i].set(value_loss)
+        entropy_losses = entropy_losses.at[i].set(entropy_loss)
+        approx_kls = approx_kls.at[i].set(approx_kl)
+
+    loss = losses.mean()
+    policy_loss = policy_losses.mean()
+    value_loss = value_losses.mean()
+    entropy_loss = entropy_losses.mean()
+    approx_kl = approx_kls.mean()
 
     variance = jnp.var(returns)
     if variance == 0:
