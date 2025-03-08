@@ -1,7 +1,6 @@
 """Validation of the NeuralCPG model using Equinox."""
 
 import logging
-from typing import Generator
 
 import diffrax
 import equinox as eqx
@@ -13,28 +12,27 @@ from jax import Array
 from jax import numpy as jnp
 from jax import random as jr
 from matplotlib import pyplot as plt
-from tqdm import trange
-from tqdm.contrib.logging import logging_redirect_tqdm
 
 from cpg_eqx import NeuralCPG, cpg_output, cpg_vector_field
+from tqdm_rich_without_warnings import tqdm
 
 sns.set_theme(style="whitegrid")
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 key = jr.key(1)
-key, data_key, model_key = jr.split(key, 3)
 
-num_oscillators = 1
+num_oscillators = 4
 convergence_factor = 100.0
 input_size = 2 * (num_oscillators + num_oscillators**2)
 input_mapping_width = 16
 input_mapping_depth = 4
-output_size = 2
-output_mapping_width = 0
-output_mapping_depth = 0
+output_size = 4
+output_mapping_width = 16
+output_mapping_depth = 4
+key, model_key = jr.split(key)
 model = NeuralCPG(
     num_oscillators=num_oscillators,
     convergence_factor=convergence_factor,
@@ -47,23 +45,22 @@ model = NeuralCPG(
     key=model_key,
 )
 
-epochs = 4
+epochs = 4096
 lr = 1e-4
 schedule = optax.schedules.cosine_decay_schedule(lr, epochs)
 optimizer = optax.adabelief(learning_rate=schedule)
 opt_state = optimizer.init(eqx.filter(model, eqx.is_inexact_array))
 
-data_length = 512
-data_points = 32
-batch_size = 4
+data_length = 2**13
 
 
-@eqx.filter_jit
 def data(key: Array) -> tuple[Array, Array, Array, Array]:
     params_key, state_key = jr.split(key)
-    params = jr.normal(params_key, (model.vector_field.param_shape,))
+    params = jr.uniform(
+        params_key, (model.vector_field.param_shape,), minval=-1.0, maxval=1.0
+    )
     y0 = jr.normal(state_key, (model.vector_field.state_shape,))
-    ts = jnp.linspace(0, 10, data_length)
+    ts = jnp.linspace(0, 32, data_length)
     term = diffrax.ODETerm(
         lambda t, y, params: cpg_vector_field(
             num_oscillators,
@@ -82,30 +79,43 @@ def data(key: Array) -> tuple[Array, Array, Array, Array]:
         dt0=ts[1] - ts[0],
         args=params,
         saveat=diffrax.SaveAt(ts=ts),
+        max_steps=data_length * 2**4,
     )
     assert solution.ys is not None
     ys = solution.ys
     zs = jax.vmap(lambda y: cpg_output(y, num_oscillators)[:output_size])(ys)
-    xs = params * jnp.ones((data_length, input_size))
+    xs = jnp.ones(ts.shape + (input_size,))
 
     return ts, ys, xs, zs
 
 
-ts, ys, xs, zs = jax.vmap(data)(jr.split(data_key, data_points))
+key, data_key = jr.split(key)
+ts, ys, xs, zs = data(data_key)
 logger.debug(f"Data shapes: {ts.shape=}, {ys.shape=}, {xs.shape=}, {zs.shape=}")
 
+key, split_key = jr.split(key)
+train_indices = jnp.sort(
+    jr.choice(key, data_length, (data_length // 4,), replace=False)
+)
+ts_train = ts[train_indices]
+ys_train = ys[train_indices]
+xs_train = xs[train_indices]
+zs_train = zs[train_indices]
+logger.debug(
+    f"Train shapes: {ts_train.shape=}, {ys_train.shape=}, {xs_train.shape=}, {zs_train.shape=}"
+)
 
-@eqx.filter_jit
+
 def run_model_scan(
     model: NeuralCPG, ts: Array, y0: Array, xs: Array
 ) -> tuple[Array, Array]:
-    def scan_fn(carry, inp):
+    def scan_fn(carry: Array, inp: tuple[Array, Array, Array]):
         t0, t1, x = inp
 
         new_carry, z_pred = model(
             ts=jnp.array([t0, t1]), y0=carry, x=x, map_output=True
         )
-        return new_carry, (new_carry, z_pred)  # Store carry history
+        return new_carry, (new_carry, z_pred)
 
     _, (ys_pred, zs_pred) = jax.lax.scan(scan_fn, y0, (ts[:-1], ts[1:], xs[:-1]))
 
@@ -115,57 +125,66 @@ def run_model_scan(
 
 @eqx.filter_value_and_grad
 def grad_loss(model: NeuralCPG, ts: Array, y0: Array, xs: Array, zs: Array) -> Array:
-    _, zs_pred = jax.vmap(lambda ts, y0, x: run_model_scan(model, ts, y0, x))(
-        ts, y0, xs
-    )
-    return jnp.mean((zs[:, 1:] - jnp.array(zs_pred)) ** 2) / len(zs)
+    _, zs_pred = run_model_scan(model, ts, y0, xs)
+    return jnp.mean((zs[1:] - jnp.array(zs_pred)) ** 2)
 
 
-@eqx.filter_jit
-def step(
+def train(
     model: NeuralCPG,
     opt_state: optax.OptState,
     ts: Array,
     y0: Array,
     xs: Array,
     zs: Array,
+    epochs: int,
+    debug: bool = False,
 ) -> tuple[Array, NeuralCPG, optax.OptState]:
-    loss, grads = grad_loss(model, ts, y0, xs, zs)
-    updates, opt_state = optimizer.update(grads, opt_state)
-    new_model = eqx.apply_updates(model, updates)
-    return loss, new_model, opt_state
+    arr, static = eqx.partition(model, eqx.is_array)
+    t = tqdm(total=epochs, desc="Training", unit="epoch")
+
+    @eqx.filter_jit
+    def step(
+        carry: tuple[Array, optax.OptState], i: Array
+    ) -> tuple[tuple[Array, optax.OptState], Array]:
+        arr, opt_state = carry
+        model: NeuralCPG = eqx.combine(arr, static)  # pyright: ignore
+        loss, grads = grad_loss(model, ts, y0, xs, zs)
+        updates, opt_state = optimizer.update(grads, opt_state)
+        model = eqx.apply_updates(model, updates)
+        if debug:
+            jax.debug.callback(
+                lambda *args, **kwargs: logger.debug(
+                    "Epoch: {epoch:04} Loss: {loss:e}".format(*args, **kwargs)
+                ),
+                epoch=i,
+                loss=loss,
+                ordered=True,
+            )
+            jax.debug.callback(t.update)
+        arr, _ = eqx.partition(model, eqx.is_array)
+        return (arr, opt_state), loss
+
+    (arr, opt_state), losses = jax.lax.scan(step, (arr, opt_state), jnp.arange(epochs))
+    model = eqx.combine(arr, static)
+    t.close()
+
+    return losses, model, opt_state
 
 
-def batches(
-    arrays: list[Array], batch_size: int, *, key: Array
-) -> Generator[list[Array], None, None]:
-    dataset_size = arrays[0].shape[0]
-    assert all(
-        array.shape[0] == dataset_size for array in arrays
-    ), "Cannot batch arrays with different sizes"
+losses, model, opt_state = train(
+    model, opt_state, ts_train, ys_train[0], xs_train, zs_train, epochs, debug=True
+)
 
-    key, batch_key = jr.split(key)
-    batch_indices = jr.permutation(batch_key, dataset_size, independent=True)
-
-    for i in range(0, dataset_size, batch_size):
-        yield [array[batch_indices[i : i + batch_size]] for array in arrays]
+plt.figure(figsize=(10, 6))
+plt.plot(losses)
+plt.yscale("log")
+plt.title("Training Loss")
+plt.show()
 
 
-with logging_redirect_tqdm():
-    for epoch in trange(epochs):
-        key, batch_key = jr.split(key)
-        losses = []
-        for n, batch in enumerate(batches([ts, ys, xs, zs], batch_size, key=batch_key)):
-            loss, model, opt_state = step(model, opt_state, ts, ys[:, 0], xs, zs)
-            losses.append(loss)
-            logger.debug(f"Batch {n:03}, Loss: {loss:0.6}")
-
-        logger.info(f"\nEpoch {epoch:03}, Loss: {jnp.asarray(losses).mean():0.6}")
-
-
-key, data_key = jr.split(key)
-ts, ys, xs, zs = data(data_key)
 ys_pred, zs_pred = run_model_scan(model, ts, ys[0], xs)
+loss, _ = grad_loss(model, ts, ys[0], xs, zs)
+logger.info(f"Final Loss: {loss}")
 
 ts = np.array(ts[1:])
 ys = np.array(ys[1:])
