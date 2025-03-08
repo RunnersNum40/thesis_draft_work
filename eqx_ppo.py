@@ -165,7 +165,6 @@ class Agent(eqx.Module):
         return logprob.sum(), entropy.sum(), self.get_value(x)
 
 
-@eqx.filter_jit
 def compute_gae(
     agent: Agent,
     next_observation: Array,
@@ -204,7 +203,6 @@ def compute_gae(
     return advantages, returns
 
 
-@eqx.filter_jit
 @eqx.filter_value_and_grad(has_aux=True)
 def loss_grad(
     agent: Agent,
@@ -217,7 +215,7 @@ def loss_grad(
     values: Array,
     log_probs: Array,
     args: Args,
-) -> tuple[Array, tuple[Array, Array, Array, Array]]:
+) -> tuple[Array, tuple[Array, Array, Array, Array, Array]]:
     new_log_prob, entropy, new_value = jax.vmap(agent.get_action_value)(
         observations, states, times, actions
     )
@@ -250,6 +248,7 @@ def loss_grad(
     entropy_loss = jnp.mean(entropy)
     loss = policy_loss - args.ent_coef * entropy_loss + args.vf_coef * value_loss
     return loss, (
+        loss,
         policy_loss,
         entropy_loss,
         value_loss,
@@ -257,130 +256,34 @@ def loss_grad(
     )
 
 
-@eqx.filter_jit
-def train_batch(
-    agent: Agent,
-    opt_state: optax.OptState,
-    optimizer: optax.GradientTransformation,
-    observations: Array,
-    states: Array,
-    times: Array,
-    actions: Array,
-    advantages: Array,
-    returns: Array,
-    values: Array,
-    log_probs: Array,
-    args: Args,
-) -> tuple[Array, Array, Array, Array, Array, Agent, optax.OptState]:
-    (loss, (policy_loss, value_loss, entropy_loss, approx_kl)), grads = loss_grad(
-        agent,
-        observations,
-        states,
-        times,
-        actions,
-        advantages,
-        returns,
-        values,
-        log_probs,
-        args,
-    )
-    updates, new_opt_state = optimizer.update(grads, opt_state)
-    new_agent = eqx.apply_updates(agent, updates)
-    return (
-        loss,
-        policy_loss,
-        value_loss,
-        entropy_loss,
-        approx_kl,
-        new_agent,
-        new_opt_state,
-    )
-
-
-@eqx.filter_jit
-def get_batches(batch_size: int, data_size: int, key: Array) -> jnp.ndarray:
+def get_batch_indices(batch_size: int, data_size: int, key: Array) -> jnp.ndarray:
     perm = jr.permutation(key, data_size, independent=True)
     num_batches = data_size // batch_size
     return perm[: num_batches * batch_size].reshape(num_batches, batch_size)
 
 
-def train_on_minibatch(
-    agent: Agent,
-    opt_state: optax.OptState,
-    optimizer: optax.GradientTransformation,
-    key: Array,
-    observations: Array,
-    states: Array,
-    times: Array,
-    actions: Array,
-    advantages: Array,
-    returns: Array,
-    values: Array,
-    log_probs: Array,
-    args: Args,
-) -> tuple[Array, Array, Array, Array, Array, Agent, optax.OptState]:
-    losses = jnp.zeros(args.num_minibatches)
-    policy_losses = jnp.zeros(args.num_minibatches)
-    value_losses = jnp.zeros(args.num_minibatches)
-    entropy_losses = jnp.zeros(args.num_minibatches)
-    approx_kls = jnp.zeros(args.num_minibatches)
-
-    for i, batch_indices in enumerate(
-        get_batches(args.minibatch_size, args.num_steps, key)
-    ):
-        (
-            loss,
-            policy_loss,
-            value_loss,
-            entropy_loss,
-            approx_kl,
-            agent,
-            opt_state,
-        ) = train_batch(
-            agent,
-            opt_state,
-            optimizer,
-            observations[batch_indices],
-            states[batch_indices],
-            times[batch_indices],
-            actions[batch_indices],
-            advantages[batch_indices],
-            returns[batch_indices],
-            values[batch_indices],
-            log_probs[batch_indices],
-            args,
-        )
-
-        losses = losses.at[i].set(loss)
-        policy_losses = policy_losses.at[i].set(policy_loss)
-        value_losses = value_losses.at[i].set(value_loss)
-        entropy_losses = entropy_losses.at[i].set(entropy_loss)
-        approx_kls = approx_kls.at[i].set(approx_kl)
-
-    loss = losses.mean()
-    policy_loss = policy_losses.mean()
-    value_loss = value_losses.mean()
-    entropy_loss = entropy_losses.mean()
-    approx_kl = approx_kls.mean()
-
-    return loss, policy_loss, value_loss, entropy_loss, approx_kl, agent, opt_state
-
-
+@eqx.filter_jit
 def update_step(
     agent: Agent,
     opt_state: optax.OptState,
     optimizer: optax.GradientTransformation,
     key: Array,
+    next_observation: Array,
+    next_done: Array,
+    rewards: Array,
+    dones: Array,
     observations: Array,
     states: Array,
     times: Array,
     actions: Array,
-    advantages: Array,
-    returns: Array,
     values: Array,
     log_probs: Array,
     args: Args,
 ) -> tuple[Agent, optax.OptState, Array, Array, Array, Array, Array, Array]:
+    advantages, returns = compute_gae(
+        agent, next_observation, next_done, rewards, values, dones, args
+    )
+
     observations, states, times, actions, advantages, returns, values, log_probs = (
         jax.tree.map(
             jax.lax.stop_gradient,
@@ -397,44 +300,62 @@ def update_step(
         )
     )
 
-    losses = jnp.zeros(args.update_epochs)
-    policy_losses = jnp.zeros(args.update_epochs)
-    value_losses = jnp.zeros(args.update_epochs)
-    entropy_losses = jnp.zeros(args.update_epochs)
-    approx_kls = jnp.zeros(args.update_epochs)
+    agent_dynamic, agent_static = eqx.partition(agent, eqx.is_array)
 
-    for i in range(args.update_epochs):
+    def epoch(
+        carry: tuple[Array, Array, optax.OptState], _
+    ) -> tuple[
+        tuple[Array, Array, optax.OptState], tuple[Array, Array, Array, Array, Array]
+    ]:
+        key, agent_dynamic, opt_state = carry
+
+        def batch(
+            carry: tuple[Array, optax.OptState], batch_indices: Array
+        ) -> tuple[
+            tuple[Array, optax.OptState], tuple[Array, Array, Array, Array, Array]
+        ]:
+            agent_dynamic, opt_state = carry
+            agent: Agent = eqx.combine(agent_dynamic, agent_static)  # pyright: ignore
+
+            (_, stats), grads = loss_grad(
+                agent,
+                observations[batch_indices],
+                states[batch_indices],
+                times[batch_indices],
+                actions[batch_indices],
+                advantages[batch_indices],
+                returns[batch_indices],
+                values[batch_indices],
+                log_probs[batch_indices],
+                args,
+            )
+
+            updates, opt_state = optimizer.update(grads, opt_state)
+            agent = eqx.apply_updates(agent, updates)
+            agent_dynamic, _ = eqx.partition(agent, eqx.is_array)
+            return (agent_dynamic, opt_state), stats
+
         key, batch_key = jr.split(key)
-        (
-            loss,
-            policy_loss,
-            value_loss,
-            entropy_loss,
-            approx_kl,
-            agent,
-            opt_state,
-        ) = train_on_minibatch(
-            agent,
-            opt_state,
-            optimizer,
-            batch_key,
-            observations,
-            states,
-            times,
-            actions,
-            advantages,
-            returns,
-            values,
-            log_probs,
-            args,
+        batch_indices = get_batch_indices(
+            args.minibatch_size, args.batch_size, batch_key
         )
 
-        losses = losses.at[i].set(loss)
-        policy_losses = policy_losses.at[i].set(policy_loss)
-        value_losses = value_losses.at[i].set(value_loss)
-        entropy_losses = entropy_losses.at[i].set(entropy_loss)
-        approx_kls = approx_kls.at[i].set(approx_kl)
+        (agent_dynamic, opt_state), batch_stats = jax.lax.scan(
+            batch,
+            (agent_dynamic, opt_state),
+            batch_indices,
+        )
 
+        carry = (key, agent_dynamic, opt_state)
+        return carry, batch_stats
+
+    init_carry = (key, agent_dynamic, opt_state)
+    carry, outputs = jax.lax.scan(epoch, init_carry, jnp.arange(args.update_epochs))
+
+    _, agent_dynamic, opt_state = carry
+    final_agent = eqx.combine(agent_dynamic, agent_static)
+
+    losses, policy_losses, value_losses, entropy_losses, approx_kls = outputs
     loss = losses.mean()
     policy_loss = policy_losses.mean()
     value_loss = value_losses.mean()
@@ -442,13 +363,12 @@ def update_step(
     approx_kl = approx_kls.mean()
 
     variance = jnp.var(returns)
-    if variance == 0:
-        explained_variance = jnp.array(0.0)
-    else:
-        explained_variance = 1 - jnp.var(returns - values) / variance
+    explained_variance = jnp.where(
+        variance == 0, 0.0, 1 - jnp.var(returns - values) / variance
+    )
 
     return (
-        agent,
+        final_agent,
         opt_state,
         loss,
         policy_loss,
@@ -561,10 +481,6 @@ if __name__ == "__main__":
                 model_state = jr.normal(state_key, agent.actor_mean.state_shape)
                 model_time = jnp.array(0.0)
 
-        advantages, returns = compute_gae(
-            agent, next_observation, next_done, rewards, values, dones, args
-        )
-
         key, iteration_key = jr.split(key)
         (
             agent,
@@ -580,12 +496,14 @@ if __name__ == "__main__":
             opt_state=opt_state,
             optimizer=optimizer,
             key=iteration_key,
+            next_observation=next_observation,
+            next_done=next_done,
+            dones=dones,
+            rewards=rewards,
             observations=observations,
             states=states,
             times=times,
             actions=actions,
-            advantages=advantages,
-            returns=returns,
             values=values,
             log_probs=log_probs,
             args=args,
