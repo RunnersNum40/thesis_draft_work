@@ -3,8 +3,8 @@
 import diffrax
 import equinox as eqx
 import jax
-from jax import numpy as jnp
 from jax import Array
+from jax import numpy as jnp
 from jax.typing import ArrayLike
 
 jax.config.update("jax_enable_x64", True)
@@ -134,6 +134,7 @@ class ForcedCPG(eqx.Module):
             width_size=input_mapping_width,
             depth=input_mapping_depth,
             activation=jax.nn.softplus,  # Continuously differentiable activation function theoretically required
+            final_activation=jax.nn.tanh,
             key=key,
         )
 
