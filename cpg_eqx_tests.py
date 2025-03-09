@@ -14,7 +14,6 @@ from jax import random as jr
 from matplotlib import pyplot as plt
 
 from cpg_eqx import NeuralCPG, cpg_output, cpg_vector_field
-from tqdm_rich_without_warnings import tqdm
 
 sns.set_theme(style="whitegrid")
 
@@ -140,7 +139,6 @@ def train(
     debug: bool = False,
 ) -> tuple[Array, NeuralCPG, optax.OptState]:
     arr, static = eqx.partition(model, eqx.is_array)
-    t = tqdm(total=epochs, desc="Training", unit="epoch")
 
     @eqx.filter_jit
     def step(
@@ -160,7 +158,6 @@ def train(
                 loss=loss,
                 ordered=True,
             )
-            jax.debug.callback(t.update)
         arr, _ = eqx.partition(model, eqx.is_array)
         return (arr, opt_state), loss
 

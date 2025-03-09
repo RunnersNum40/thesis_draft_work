@@ -13,9 +13,9 @@ from jax import Array
 from jax import numpy as jnp
 from jax import random as jr
 from torch.utils.tensorboard.writer import SummaryWriter
+from tqdm import trange
 
 from cpg_eqx import NeuralCPG
-from tqdm_rich_without_warnings import trange
 
 
 @dataclass
@@ -446,7 +446,7 @@ if __name__ == "__main__":
     model_state = jr.normal(state_key, agent.actor_mean.state_shape)
     model_time = jnp.array(0.0)
 
-    for iteration in trange(1, args.num_iterations + 1):
+    for iteration in trange(1, args.num_iterations + 1, desc="Training"):
         for step in range(args.num_steps):
             global_step += 1
 
