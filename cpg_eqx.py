@@ -1,5 +1,8 @@
 """Equinox implementation of a Neural Central Pattern Generator (CPG) model."""
 
+from abc import abstractmethod
+from typing import Generic, TypeVar
+
 import diffrax
 import equinox as eqx
 import jax
@@ -8,6 +11,73 @@ from jax import numpy as jnp
 from jax.typing import ArrayLike
 
 jax.config.update("jax_enable_x64", True)
+
+
+class AbstractVectorField(eqx.Module):
+    state_shape: eqx.AbstractVar[int]
+
+    @abstractmethod
+    def __call__(self, t: float, y: Array, x: Array) -> Array:
+        """Compute the vector field at a given state with external input."""
+        raise NotImplementedError
+
+
+class AbstractOutputMapping(eqx.Module):
+    @abstractmethod
+    def __call__(self, y: Array) -> Array:
+        """Map a state to an actor output."""
+        raise NotImplementedError
+
+
+VF = TypeVar("VF", bound=AbstractVectorField)
+OM = TypeVar("OM", bound=AbstractOutputMapping)
+
+
+class NeuralActor(eqx.Module, Generic[VF, OM]):
+    vector_field: eqx.AbstractVar[VF]
+    output_mapping: eqx.AbstractVar[OM]
+
+    def __call__(
+        self,
+        ts: Array,
+        y0: Array,
+        x: ArrayLike,
+        *,
+        map_output: bool = True,
+        max_solver_steps: int = 2**10,
+    ) -> tuple[Array, Array | None]:
+        term = diffrax.ODETerm(self.vector_field)  # pyright: ignore
+        solver = diffrax.Heun()
+        t0 = ts[0]
+        t1 = ts[-1]
+        dt0 = ts[1] - ts[0]
+        # stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-6)
+        saveat = diffrax.SaveAt(t1=True)
+
+        solution = diffrax.diffeqsolve(
+            term,
+            solver=solver,
+            t0=t0,
+            t1=t1,
+            dt0=dt0,
+            y0=y0,
+            # stepsize_controller=stepsize_controller,
+            saveat=saveat,
+            args=x,
+            max_steps=max_solver_steps,
+        )
+
+        assert solution.ys is not None
+        state = solution.ys[-1]
+
+        if map_output:
+            return state, self.output_mapping(state)
+
+        return state, None
+
+    @property
+    def state_shape(self) -> tuple[int]:
+        return (self.vector_field.state_shape,)
 
 
 def split_states(states: ArrayLike, num_oscillators: int) -> tuple[Array, Array, Array]:
@@ -102,7 +172,7 @@ def cpg_output(state: ArrayLike, num_oscillators: int) -> Array:
     return jnp.concatenate([amplitudes * jnp.cos(phases), amplitudes * jnp.sin(phases)])
 
 
-class ForcedCPG(eqx.Module):
+class ForcedCPG(AbstractVectorField):
     """Parameterized CPG vector field with an external input."""
 
     num_oscillators: int
@@ -120,9 +190,7 @@ class ForcedCPG(eqx.Module):
         input_mapping_depth: int,
         *,
         key: Array,
-        **kwargs,
     ) -> None:
-        super().__init__(**kwargs)
         self.num_oscillators = num_oscillators
         self.convergence_factor = convergence_factor
         self.state_shape = 3 * num_oscillators
@@ -145,7 +213,7 @@ class ForcedCPG(eqx.Module):
         )
 
 
-class CPGOutputMap(eqx.Module):
+class CPGOutputMap(AbstractOutputMapping):
     """Map a CPG state to an output."""
 
     num_oscillators: int
@@ -160,10 +228,7 @@ class CPGOutputMap(eqx.Module):
         output_mapping_depth: int,
         *,
         key: Array,
-        **kwargs,
     ) -> None:
-        super().__init__(**kwargs)
-
         self.num_oscillators = num_oscillators
         self.output_shape = (
             2 * num_oscillators
@@ -180,7 +245,7 @@ class CPGOutputMap(eqx.Module):
         return self.output_mapping(cpg_output(y, self.num_oscillators))
 
 
-class NeuralCPG(eqx.Module):
+class NeuralCPG(NeuralActor[ForcedCPG, CPGOutputMap]):
     """CPG dynamics incorporating external input and output mapping."""
 
     num_oscillators: int
@@ -200,10 +265,7 @@ class NeuralCPG(eqx.Module):
         output_mapping_depth: int,
         *,
         key: Array,
-        **kwargs,
     ) -> None:
-        super().__init__(**kwargs)
-
         input_key, output_key = jax.random.split(key)
 
         self.num_oscillators = num_oscillators
@@ -225,48 +287,6 @@ class NeuralCPG(eqx.Module):
             output_mapping_depth,
             key=output_key,
         )
-
-    def __call__(
-        self,
-        ts: Array,
-        y0: Array,
-        x: ArrayLike,
-        *,
-        map_output: bool = False,
-        max_solver_steps: int = 2**10,
-    ) -> tuple[Array, Array | None]:
-        term = diffrax.ODETerm(self.vector_field)  # pyright: ignore
-        solver = diffrax.Heun()
-        t0 = ts[0]
-        t1 = ts[-1]
-        dt0 = ts[1] - ts[0]
-        # stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-6)
-        saveat = diffrax.SaveAt(t1=True)
-
-        solution = diffrax.diffeqsolve(
-            term,
-            solver=solver,
-            t0=t0,
-            t1=t1,
-            dt0=dt0,
-            y0=y0,
-            # stepsize_controller=stepsize_controller,
-            saveat=saveat,
-            args=x,
-            max_steps=max_solver_steps,
-        )
-
-        assert solution.ys is not None
-        state = solution.ys[-1]
-
-        if map_output:
-            return state, self.output_mapping(state)
-
-        return state, None
-
-    @property
-    def state_shape(self) -> tuple[int]:
-        return (self.vector_field.state_shape,)
 
     @property
     def param_shape(self) -> tuple[int]:
