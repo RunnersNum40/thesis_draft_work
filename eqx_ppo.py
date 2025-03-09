@@ -67,7 +67,7 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float | None = None
     """the target KL divergence threshold"""
-    timestep: float = 1e-3
+    timestep: float = 1e-2
     """timestep of the Neural CPG model"""
 
     # to be filled in runtime
@@ -441,6 +441,7 @@ if __name__ == "__main__":
             states = states.at[step].set(model_state)
             times = times.at[step].set(ts)
             dones = dones.at[step].set(next_done)
+            model_time = ts[1]
 
             key, subkey = jr.split(key)
             model_state, action, log_prob, _, value = agent.get_action_and_value(
