@@ -67,8 +67,14 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float | None = None
     """the target KL divergence threshold"""
+
+    # Neural CPG parameters
     timestep: float = 1e-2
-    """timestep of the Neural CPG model"""
+    """timestep of the model"""
+    num_oscillators: int = 2
+    """the number of oscillators in the model"""
+    convergence_factor: float = 100.0
+    """convergence factor of the model"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -98,19 +104,19 @@ class Agent(eqx.Module):
             in_size=int(jnp.asarray(env.observation_space.shape).prod()),
             out_size=1,
             width_size=64,
-            depth=2,
+            depth=1,
             activation=jax.nn.tanh,
             key=critic_key,
         )
         self.actor_mean = NeuralCPG(
-            1,
-            100.0,
+            args.num_oscillators,
+            args.convergence_factor,
             input_size=int(jnp.asarray(env.observation_space.shape).prod()),
             input_mapping_width=64,
-            input_mapping_depth=2,
+            input_mapping_depth=1,
             output_size=int(jnp.asarray(env.action_space.shape).prod()),
             output_mapping_width=64,
-            output_mapping_depth=2,
+            output_mapping_depth=1,
             key=actor_mean_key,
         )
         self.actor_logstd = jnp.zeros(jnp.asarray(env.action_space.shape).prod())
