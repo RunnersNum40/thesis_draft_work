@@ -215,7 +215,7 @@ def loss_grad(
     values: Array,
     log_probs: Array,
     args: Args,
-) -> tuple[Array, tuple[Array, Array, Array, Array, Array]]:
+) -> tuple[Array, dict[str, Array]]:
     new_log_prob, entropy, new_value = jax.vmap(agent.get_action_value)(
         observations, states, times, actions
     )
@@ -247,13 +247,14 @@ def loss_grad(
 
     entropy_loss = jnp.mean(entropy)
     loss = policy_loss - args.ent_coef * entropy_loss + args.vf_coef * value_loss
-    return loss, (
-        loss,
-        policy_loss,
-        entropy_loss,
-        value_loss,
-        jax.lax.stop_gradient(approx_kl),
-    )
+    stats = {
+        "total": loss,
+        "policy": policy_loss,
+        "value": value_loss,
+        "entropy": entropy_loss,
+        "kl": approx_kl,
+    }
+    return loss, stats
 
 
 def get_batch_indices(batch_size: int, data_size: int, key: Array) -> jnp.ndarray:
@@ -279,7 +280,7 @@ def update_step(
     values: Array,
     log_probs: Array,
     args: Args,
-) -> tuple[Agent, optax.OptState, Array, Array, Array, Array, Array, Array]:
+) -> tuple[Agent, optax.OptState, dict[str, Array]]:
     advantages, returns = compute_gae(
         agent, next_observation, next_done, rewards, values, dones, args
     )
@@ -304,16 +305,12 @@ def update_step(
 
     def epoch(
         carry: tuple[Array, Array, optax.OptState], _
-    ) -> tuple[
-        tuple[Array, Array, optax.OptState], tuple[Array, Array, Array, Array, Array]
-    ]:
+    ) -> tuple[tuple[Array, Array, optax.OptState], dict[str, Array]]:
         key, agent_dynamic, opt_state = carry
 
         def batch(
             carry: tuple[Array, optax.OptState], batch_indices: Array
-        ) -> tuple[
-            tuple[Array, optax.OptState], tuple[Array, Array, Array, Array, Array]
-        ]:
+        ) -> tuple[tuple[Array, optax.OptState], dict[str, Array]]:
             agent_dynamic, opt_state = carry
             agent: Agent = eqx.combine(agent_dynamic, agent_static)  # pyright: ignore
 
@@ -340,43 +337,32 @@ def update_step(
             args.minibatch_size, args.batch_size, batch_key
         )
 
-        (agent_dynamic, opt_state), batch_stats = jax.lax.scan(
+        (agent_dynamic, opt_state), stats = jax.lax.scan(
             batch,
             (agent_dynamic, opt_state),
             batch_indices,
         )
+        stats = jax.tree.map(lambda x: x.mean(), stats)
 
         carry = (key, agent_dynamic, opt_state)
-        return carry, batch_stats
+        return carry, stats
 
     init_carry = (key, agent_dynamic, opt_state)
-    carry, outputs = jax.lax.scan(epoch, init_carry, jnp.arange(args.update_epochs))
+    carry, stats = jax.lax.scan(epoch, init_carry, jnp.arange(args.update_epochs))
+    stats = jax.tree.map(lambda x: x.mean(), stats)
 
     _, agent_dynamic, opt_state = carry
-    final_agent = eqx.combine(agent_dynamic, agent_static)
-
-    losses, policy_losses, value_losses, entropy_losses, approx_kls = outputs
-    loss = losses.mean()
-    policy_loss = policy_losses.mean()
-    value_loss = value_losses.mean()
-    entropy_loss = entropy_losses.mean()
-    approx_kl = approx_kls.mean()
+    agent = eqx.combine(agent_dynamic, agent_static)
 
     variance = jnp.var(returns)
     explained_variance = jnp.where(
-        variance == 0, 0.0, 1 - jnp.var(returns - values) / variance
+        variance == 0, jnp.nan, 1 - jnp.var(returns - values) / variance
     )
+    stats["explained_variance"] = explained_variance
 
-    return (
-        final_agent,
-        opt_state,
-        loss,
-        policy_loss,
-        value_loss,
-        entropy_loss,
-        approx_kl,
-        explained_variance,
-    )
+    stats["learning_rate"] = opt_state[1].hyperparams["learning_rate"]
+
+    return agent, opt_state, stats
 
 
 if __name__ == "__main__":
@@ -482,16 +468,7 @@ if __name__ == "__main__":
                 model_time = jnp.array(0.0)
 
         key, iteration_key = jr.split(key)
-        (
-            agent,
-            opt_state,
-            loss,
-            policy_loss,
-            value_loss,
-            entropy_loss,
-            approx_kl,
-            explained_variance,
-        ) = update_step(
+        agent, opt_state, stats = update_step(
             agent=agent,
             opt_state=opt_state,
             optimizer=optimizer,
@@ -509,19 +486,9 @@ if __name__ == "__main__":
             args=args,
         )
 
-        writer.add_scalar("loss/total", float(loss), global_step)
-        writer.add_scalar("loss/policy", float(policy_loss), global_step)
-        writer.add_scalar("loss/value", float(value_loss), global_step)
-        writer.add_scalar("loss/entropy", float(entropy_loss), global_step)
-        writer.add_scalar("loss/kl", float(approx_kl), global_step)
-        writer.add_scalar(
-            "loss/explained_variance", float(explained_variance), global_step
-        )
-        writer.add_scalar(
-            "loss/learning_rate",
-            float(opt_state[1].hyperparams["learning_rate"]),  # pyright: ignore
-            global_step,
-        )
+        stats = jax.tree.map(float, stats)
+        for stat, value in stats.items():
+            writer.add_scalar(f"loss/{stat}", value, global_step)
 
     env.close()
     writer.close()
