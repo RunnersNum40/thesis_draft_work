@@ -24,14 +24,6 @@ class Args:
     """the name of this experiment"""
     seed: int = 1
     """seed of the experiment"""
-    torch_deterministic: bool = True
-    """if toggled, `torch.backends.cudnn.deterministic=False`"""
-    cuda: bool = True
-    """if toggled, cuda will be enabled by default"""
-    capture_video: bool = False
-    """whether to capture videos of the agent performances (check out `videos` folder)"""
-    save_model: bool = False
-    """whether to save model into the `runs/{run_name}` folder"""
 
     env_id: str = "InvertedPendulum-v5"
     """the id of the environment"""
@@ -386,11 +378,7 @@ if __name__ == "__main__":
     np.random.seed(args.seed)
     key = jr.key(args.seed)
 
-    if args.capture_video:
-        env = gym.make(args.env_id, render_mode="rgb_array")
-        env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-    else:
-        env = gym.make(args.env_id)
+    env = gym.make(args.env_id)
     env = gym.wrappers.FlattenObservation(env)
     env = gym.wrappers.RecordEpisodeStatistics(env)
     env = gym.wrappers.ClipAction(env)
