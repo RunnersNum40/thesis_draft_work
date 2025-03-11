@@ -13,7 +13,13 @@ from jax.typing import ArrayLike
 jax.config.update("jax_enable_x64", True)
 
 
+VF = TypeVar("VF", bound="AbstractVectorField")
+OM = TypeVar("OM", bound="AbstractOutputMapping")
+
+
 class AbstractVectorField(eqx.Module):
+    """Abstract module to compute the vector field of a dynamical system."""
+
     state_shape: eqx.AbstractVar[int]
 
     @abstractmethod
@@ -23,19 +29,33 @@ class AbstractVectorField(eqx.Module):
 
 
 class AbstractOutputMapping(eqx.Module):
+    """Abstract module to map a system's state to an actor output."""
+
     @abstractmethod
     def __call__(self, y: Array) -> Array:
         """Map a state to an actor output."""
         raise NotImplementedError
 
 
-VF = TypeVar("VF", bound=AbstractVectorField)
-OM = TypeVar("OM", bound=AbstractOutputMapping)
+class AbstractNeuralActor(eqx.Module, Generic[VF, OM]):
+    """Abstract module to represent a neural actor model.
 
+    Neural actor models are dynamical systems with external input and output mapping.
+    """
 
-class NeuralActor(eqx.Module, Generic[VF, OM]):
     vector_field: eqx.AbstractVar[VF]
     output_mapping: eqx.AbstractVar[OM]
+
+    def __check_init__(self):
+        if not isinstance(self.vector_field, AbstractVectorField):
+            raise TypeError(
+                f"Expected vector_field to be a subclass of AbstractVectorField, got {self.vector_field} instead"
+            )
+
+        if not isinstance(self.output_mapping, AbstractOutputMapping):
+            raise TypeError(
+                f"Expected output_mapping to be a subclass of AbstractOutputMapping, got {self.output_mapping} instead"
+            )
 
     def __call__(
         self,
@@ -44,15 +64,19 @@ class NeuralActor(eqx.Module, Generic[VF, OM]):
         x: ArrayLike,
         *,
         map_output: bool = True,
-        max_solver_steps: int = 2**10,
+        max_steps: int = 4096,
+        adaptive_step_size: bool = False,
     ) -> tuple[Array, Array | None]:
         term = diffrax.ODETerm(self.vector_field)  # pyright: ignore
         solver = diffrax.Heun()
         t0 = ts[0]
         t1 = ts[-1]
         dt0 = ts[1] - ts[0]
-        # stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-6)
         saveat = diffrax.SaveAt(t1=True)
+        if adaptive_step_size:
+            stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-6)
+        else:
+            stepsize_controller = diffrax.ConstantStepSize()
 
         solution = diffrax.diffeqsolve(
             term,
@@ -61,10 +85,10 @@ class NeuralActor(eqx.Module, Generic[VF, OM]):
             t1=t1,
             dt0=dt0,
             y0=y0,
-            # stepsize_controller=stepsize_controller,
+            stepsize_controller=stepsize_controller,
             saveat=saveat,
             args=x,
-            max_steps=max_solver_steps,
+            max_steps=max_steps,
         )
 
         assert solution.ys is not None
@@ -129,7 +153,7 @@ def merge_params(
 def cpg_vector_field(
     num_oscillators: int,
     convergence_factor: float,
-    t: float,
+    _: float,
     state: ArrayLike,
     params: ArrayLike,
 ) -> Array:
@@ -245,8 +269,8 @@ class CPGOutputMap(AbstractOutputMapping):
         return self.output_mapping(cpg_output(y, self.num_oscillators))
 
 
-class NeuralCPG(NeuralActor[ForcedCPG, CPGOutputMap]):
-    """CPG dynamics incorporating external input and output mapping."""
+class CPGNeuralActor(AbstractNeuralActor[ForcedCPG, CPGOutputMap]):
+    """Neural actor with a CPG inductive bias"""
 
     num_oscillators: int
     convergence_factor: float

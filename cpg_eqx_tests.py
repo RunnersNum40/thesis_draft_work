@@ -13,7 +13,7 @@ from jax import numpy as jnp
 from jax import random as jr
 from matplotlib import pyplot as plt
 
-from cpg_eqx import NeuralCPG, cpg_output, cpg_vector_field
+from cpg_eqx import CPGNeuralActor, cpg_output, cpg_vector_field
 
 sns.set_theme(style="whitegrid")
 
@@ -27,12 +27,12 @@ num_oscillators = 4
 convergence_factor = 100.0
 input_size = 2 * (num_oscillators + num_oscillators**2)
 input_mapping_width = 16
-input_mapping_depth = 4
+input_mapping_depth = 2
 output_size = 4
 output_mapping_width = 16
-output_mapping_depth = 4
+output_mapping_depth = 0
 key, model_key = jr.split(key)
-model = NeuralCPG(
+model = CPGNeuralActor(
     num_oscillators=num_oscillators,
     convergence_factor=convergence_factor,
     input_size=input_size,
@@ -44,7 +44,7 @@ model = NeuralCPG(
     key=model_key,
 )
 
-epochs = 4096
+epochs = 2**13
 lr = 1e-4
 schedule = optax.schedules.cosine_decay_schedule(lr, epochs)
 optimizer = optax.adabelief(learning_rate=schedule)
@@ -59,7 +59,7 @@ def data(key: Array) -> tuple[Array, Array, Array, Array]:
         params_key, (model.vector_field.param_shape,), minval=-1.0, maxval=1.0
     )
     y0 = jr.normal(state_key, (model.vector_field.state_shape,))
-    ts = jnp.linspace(0, 32, data_length)
+    ts = jnp.linspace(0, 10, data_length)
     term = diffrax.ODETerm(
         lambda t, y, params: cpg_vector_field(
             num_oscillators,
@@ -106,14 +106,12 @@ logger.debug(
 
 
 def run_model_scan(
-    model: NeuralCPG, ts: Array, y0: Array, xs: Array
+    model: CPGNeuralActor, ts: Array, y0: Array, xs: Array
 ) -> tuple[Array, Array]:
     def scan_fn(carry: Array, inp: tuple[Array, Array, Array]):
         t0, t1, x = inp
 
-        new_carry, z_pred = model(
-            ts=jnp.array([t0, t1]), y0=carry, x=x, map_output=True
-        )
+        new_carry, z_pred = model(ts=jnp.array([t0, t1]), y0=carry, x=x)
         return new_carry, (new_carry, z_pred)
 
     _, (ys_pred, zs_pred) = jax.lax.scan(scan_fn, y0, (ts[:-1], ts[1:], xs[:-1]))
@@ -123,13 +121,15 @@ def run_model_scan(
 
 
 @eqx.filter_value_and_grad
-def grad_loss(model: NeuralCPG, ts: Array, y0: Array, xs: Array, zs: Array) -> Array:
+def grad_loss(
+    model: CPGNeuralActor, ts: Array, y0: Array, xs: Array, zs: Array
+) -> Array:
     _, zs_pred = run_model_scan(model, ts, y0, xs)
     return jnp.mean((zs[1:] - jnp.array(zs_pred)) ** 2)
 
 
 def train(
-    model: NeuralCPG,
+    model: CPGNeuralActor,
     opt_state: optax.OptState,
     ts: Array,
     y0: Array,
@@ -137,7 +137,7 @@ def train(
     zs: Array,
     epochs: int,
     debug: bool = False,
-) -> tuple[Array, NeuralCPG, optax.OptState]:
+) -> tuple[Array, CPGNeuralActor, optax.OptState]:
     arr, static = eqx.partition(model, eqx.is_array)
 
     @eqx.filter_jit
@@ -145,7 +145,7 @@ def train(
         carry: tuple[Array, optax.OptState], i: Array
     ) -> tuple[tuple[Array, optax.OptState], Array]:
         arr, opt_state = carry
-        model: NeuralCPG = eqx.combine(arr, static)  # pyright: ignore
+        model: CPGNeuralActor = eqx.combine(arr, static)  # pyright: ignore
         loss, grads = grad_loss(model, ts, y0, xs, zs)
         updates, opt_state = optimizer.update(grads, opt_state)
         model = eqx.apply_updates(model, updates)
@@ -163,7 +163,6 @@ def train(
 
     (arr, opt_state), losses = jax.lax.scan(step, (arr, opt_state), jnp.arange(epochs))
     model = eqx.combine(arr, static)
-    t.close()
 
     return losses, model, opt_state
 

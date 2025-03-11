@@ -15,7 +15,7 @@ from jax import random as jr
 from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import trange
 
-from cpg_eqx import NeuralCPG
+from cpg_eqx import CPGNeuralActor
 
 
 @dataclass
@@ -90,7 +90,7 @@ class Args:
 
 class Agent(eqx.Module):
     critic: eqx.nn.MLP
-    actor_mean: NeuralCPG
+    actor_mean: CPGNeuralActor
     actor_logstd: Array
 
     def __init__(self, env: gym.Env, *, key: Array, **kwargs):
@@ -108,7 +108,7 @@ class Agent(eqx.Module):
             activation=jax.nn.tanh,
             key=critic_key,
         )
-        self.actor_mean = NeuralCPG(
+        self.actor_mean = CPGNeuralActor(
             args.num_oscillators,
             args.convergence_factor,
             input_size=int(jnp.asarray(env.observation_space.shape).prod()),
@@ -134,9 +134,7 @@ class Agent(eqx.Module):
             state.shape == self.actor_mean.state_shape
         ), f"{state.shape=}, {self.actor_mean.state_shape=}"
 
-        state, action_mean = self.actor_mean(
-            ts, state, x, map_output=True, max_solver_steps=2**14
-        )
+        state, action_mean = self.actor_mean(ts, state, x, max_steps=2**14)
         assert action_mean is not None
 
         action_std = jnp.exp(self.actor_logstd)
@@ -159,9 +157,7 @@ class Agent(eqx.Module):
         assert ts.shape == (2,)
         assert state.shape == self.actor_mean.state_shape
 
-        state, action_mean = self.actor_mean(
-            ts, state, x, map_output=True, max_solver_steps=2**14
-        )
+        state, action_mean = self.actor_mean(ts, state, x, max_steps=2**14)
         assert action_mean is not None
 
         action_std = jnp.exp(self.actor_logstd)
