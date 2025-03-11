@@ -13,7 +13,7 @@ from jax import numpy as jnp
 from jax import random as jr
 from matplotlib import pyplot as plt
 
-from cpg_eqx import CPGNeuralActor, cpg_output, cpg_vector_field
+from cpg_neural_actor import CPGNeuralActor, cpg_output, cpg_vector_field
 
 sns.set_theme(style="whitegrid")
 

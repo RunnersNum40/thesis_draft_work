@@ -15,7 +15,7 @@ from jax import random as jr
 from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import trange
 
-from cpg_eqx import CPGNeuralActor
+from cpg_neural_actor import CPGNeuralActor
 
 
 @dataclass
