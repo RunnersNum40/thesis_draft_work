@@ -4,6 +4,7 @@ import equinox as eqx
 import jax
 from jax import Array
 from jax import numpy as jnp
+from jax import random as jr
 from jax.typing import ArrayLike
 
 from neural_actor import AbstractNeuralActor, AbstractOutputMapping, AbstractVectorField
@@ -224,3 +225,6 @@ class CPGNeuralActor(AbstractNeuralActor[ForcedCPG, CPGOutputMap], strict=True):
     @property
     def output_shape(self) -> tuple[int]:
         return (self.output_mapping.output_shape,)
+
+    def initial_state(self, key: Array | None) -> Array:
+        return jnp.zeros(self.vector_field.state_shape)

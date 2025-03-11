@@ -92,3 +92,6 @@ class UnbiasedNeuralActor(AbstractNeuralActor[UnbiasedField, UnbiasedMap]):
             output_size,
             key=output_key,
         )
+
+    def initial_state(self, key: Array | None) -> Array:
+        return jnp.zeros(self.vector_field.state_shape)

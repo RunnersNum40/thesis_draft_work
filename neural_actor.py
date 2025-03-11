@@ -99,3 +99,8 @@ class AbstractNeuralActor(eqx.Module, Generic[VF, OM], strict=True):
     @property
     def state_shape(self) -> tuple[int]:
         return (self.vector_field.state_shape,)
+
+    @abstractmethod
+    def initial_state(self, key: Array | None) -> Array:
+        """Generate an initial state for the model."""
+        raise NotImplementedError

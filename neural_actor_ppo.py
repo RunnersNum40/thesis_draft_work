@@ -15,7 +15,7 @@ from jax import random as jr
 from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import trange
 
-from cpg_neural_actor import CPGNeuralActor
+from unbiased_neural_actor import UnbiasedNeuralActor
 
 
 @dataclass
@@ -25,7 +25,7 @@ class Args:
     seed: int = 1
     """seed of the experiment"""
 
-    env_id: str = "InvertedPendulum-v5"
+    env_id: str = "Pendulum-v1"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -59,14 +59,8 @@ class Args:
     """the maximum norm for the gradient clipping"""
     target_kl: float | None = None
     """the target KL divergence threshold"""
-
-    # Neural CPG parameters
-    timestep: float = 1e-2
-    """timestep of the model"""
-    num_oscillators: int = 2
-    """the number of oscillators in the model"""
-    convergence_factor: float = 100.0
-    """convergence factor of the model"""
+    actor_timestep: float = 0.01
+    """the timestep for the agent internal ODE"""
 
     # to be filled in runtime
     batch_size: int = 0
@@ -82,7 +76,7 @@ class Args:
 
 class Agent(eqx.Module):
     critic: eqx.nn.MLP
-    actor_mean: CPGNeuralActor
+    actor_mean: UnbiasedNeuralActor
     actor_logstd: Array
 
     def __init__(self, env: gym.Env, *, key: Array, **kwargs):
@@ -100,15 +94,14 @@ class Agent(eqx.Module):
             activation=jax.nn.tanh,
             key=critic_key,
         )
-        self.actor_mean = CPGNeuralActor(
-            args.num_oscillators,
-            args.convergence_factor,
+        self.actor_mean = UnbiasedNeuralActor(
+            state_shape=16,
             input_size=int(jnp.asarray(env.observation_space.shape).prod()),
             input_mapping_width=64,
-            input_mapping_depth=1,
+            input_mapping_depth=2,
             output_size=int(jnp.asarray(env.action_space.shape).prod()),
             output_mapping_width=64,
-            output_mapping_depth=1,
+            output_mapping_depth=2,
             key=actor_mean_key,
         )
         self.actor_logstd = jnp.zeros(jnp.asarray(env.action_space.shape).prod())
@@ -157,6 +150,9 @@ class Agent(eqx.Module):
         entropy = 0.5 * (jnp.log(2 * jnp.pi * action_std**2) + 1)
 
         return logprob.sum(), entropy.sum(), self.get_value(x)
+
+    def initial_state(self, key: Array) -> Array:
+        return self.actor_mean.initial_state(key)
 
 
 def compute_gae(
@@ -258,7 +254,7 @@ def get_batch_indices(batch_size: int, data_size: int, key: Array) -> jnp.ndarra
 
 
 @eqx.filter_jit
-def update_step(
+def training_step(
     agent: Agent,
     opt_state: optax.OptState,
     optimizer: optax.GradientTransformation,
@@ -359,6 +355,94 @@ def update_step(
     return agent, opt_state, stats
 
 
+def rollout(
+    env: gym.Env,
+    agent: Agent,
+    agent_state: Array,
+    agent_time: Array,
+    next_observation: Array,
+    next_done: Array,
+    global_step: int,
+    args: Args,
+    writer: SummaryWriter,
+    key: Array,
+):
+    observations = jnp.zeros((args.num_steps,) + env.observation_space.shape)
+    states = jnp.zeros((args.num_steps,) + agent.actor_mean.state_shape)
+    times = jnp.zeros((args.num_steps, 2))
+    actions = jnp.zeros((args.num_steps,) + env.action_space.shape)
+    log_probs = jnp.zeros((args.num_steps,))
+    rewards = jnp.zeros((args.num_steps,))
+    dones = jnp.zeros((args.num_steps,))
+    values = jnp.zeros((args.num_steps,))
+
+    for step in range(args.num_steps):
+        global_step += 1
+
+        ts = jnp.array([agent_time, agent_time + args.actor_timestep])
+        observations = observations.at[step].set(next_observation)
+        states = states.at[step].set(agent_state)
+        times = times.at[step].set(ts)
+        dones = dones.at[step].set(next_done)
+        agent_time = ts[1]
+
+        key, action_key = jr.split(key)
+        agent_state, action, log_prob, _, value = agent.get_action_and_value(
+            next_observation, agent_state, ts, action_key
+        )
+        values = values.at[step].set(value)
+        actions = actions.at[step].set(action)
+        log_probs = log_probs.at[step].set(log_prob)
+
+        next_observation, reward, termination, truncation, info = env.step(action)
+        rewards = rewards.at[step].set(reward)
+        next_observation = jnp.asarray(next_observation)
+        next_done = jnp.asarray(int(termination or truncation))
+
+        if "episode" in info:
+            writer.add_scalar("episode/reward", info["episode"]["r"], global_step)
+            writer.add_scalar("episode/length", info["episode"]["l"], global_step)
+            writer.add_scalar("episode/time", info["episode"]["t"], global_step)
+
+        if termination or truncation:
+            next_observation, _ = env.reset(seed=random.randint(0, 2**32 - 1))
+            next_observation = jnp.array(next_observation)
+            key, state_key = jr.split(key)
+            agent_state = agent.initial_state(state_key)
+            agent_time = jnp.array(0.0)
+
+    return (
+        agent_state,
+        agent_time,
+        next_observation,
+        next_done,
+        global_step,
+        observations,
+        states,
+        times,
+        actions,
+        log_probs,
+        rewards,
+        dones,
+        values,
+    )
+
+
+@eqx.filter_jit
+def write_stats(
+    writer: SummaryWriter, stats: dict[str, Array], global_step: int
+) -> None:
+    for stat, value in stats.items():
+        jax.debug.callback(
+            lambda stat, value, global_step: writer.add_scalar(
+                f"loss/{stat}", float(value), global_step
+            ),
+            stat,
+            value,
+            global_step,
+        )
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_steps)
@@ -379,7 +463,6 @@ if __name__ == "__main__":
     key = jr.key(args.seed)
 
     env = gym.make(args.env_id)
-    env = gym.wrappers.FlattenObservation(env)
     env = gym.wrappers.RecordEpisodeStatistics(env)
     env = gym.wrappers.ClipAction(env)
     env = gym.wrappers.NormalizeObservation(env)
@@ -404,66 +487,50 @@ if __name__ == "__main__":
     optimizer = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), adam)
     opt_state = optimizer.init(eqx.filter(agent, eqx.is_inexact_array))
 
-    observations = jnp.zeros((args.num_steps,) + env.observation_space.shape)
-    states = jnp.zeros((args.num_steps,) + agent.actor_mean.state_shape)
-    times = jnp.zeros((args.num_steps, 2))
-    actions = jnp.zeros((args.num_steps,) + env.action_space.shape)
-    log_probs = jnp.zeros((args.num_steps,))
-    rewards = jnp.zeros((args.num_steps,))
-    dones = jnp.zeros((args.num_steps,))
-    values = jnp.zeros((args.num_steps,))
-
     global_step = 0
     next_done = jnp.array(0)
 
     next_observation, _ = env.reset(seed=random.randint(0, 2**32 - 1))
     next_observation = jnp.asarray(next_observation)
     key, state_key = jr.split(key)
-    model_state = jr.normal(state_key, agent.actor_mean.state_shape)
-    model_time = jnp.array(0.0)
+    agent_state = agent.initial_state(state_key)
+    agent_time = jnp.array(0.0)
 
     for iteration in trange(1, args.num_iterations + 1, desc="Training"):
-        for step in range(args.num_steps):
-            global_step += 1
+        key, rollout_key = jr.split(key)
+        (
+            agent_state,
+            agent_time,
+            next_observation,
+            next_done,
+            global_step,
+            observations,
+            states,
+            times,
+            actions,
+            log_probs,
+            rewards,
+            dones,
+            values,
+        ) = rollout(
+            env,
+            agent,
+            agent_state,
+            agent_time,
+            next_observation,
+            next_done,
+            global_step,
+            args,
+            writer,
+            rollout_key,
+        )
 
-            ts = jnp.array([model_time, model_time + args.timestep])
-            observations = observations.at[step].set(next_observation)
-            states = states.at[step].set(model_state)
-            times = times.at[step].set(ts)
-            dones = dones.at[step].set(next_done)
-            model_time = ts[1]
-
-            key, subkey = jr.split(key)
-            model_state, action, log_prob, _, value = agent.get_action_and_value(
-                next_observation, model_state, ts, subkey
-            )
-            values = values.at[step].set(value)
-            actions = actions.at[step].set(action)
-            log_probs = log_probs.at[step].set(log_prob)
-
-            next_observation, reward, termination, truncation, info = env.step(action)
-            rewards = rewards.at[step].set(reward)
-            next_observation = jnp.asarray(next_observation)
-            next_done = jnp.asarray(int(termination or truncation))
-
-            if "episode" in info:
-                writer.add_scalar("episode/reward", info["episode"]["r"], global_step)
-                writer.add_scalar("episode/length", info["episode"]["l"], global_step)
-                writer.add_scalar("episode/time", info["episode"]["t"], global_step)
-
-            if termination or truncation:
-                next_observation, _ = env.reset(seed=random.randint(0, 2**32 - 1))
-                next_observation = jnp.array(next_observation)
-                key, state_key = jr.split(key)
-                model_state = jr.normal(state_key, agent.actor_mean.state_shape)
-                model_time = jnp.array(0.0)
-
-        key, iteration_key = jr.split(key)
-        agent, opt_state, stats = update_step(
+        key, training_key = jr.split(key)
+        agent, opt_state, stats = training_step(
             agent=agent,
             opt_state=opt_state,
             optimizer=optimizer,
-            key=iteration_key,
+            key=training_key,
             next_observation=next_observation,
             next_done=next_done,
             dones=dones,
@@ -477,9 +544,7 @@ if __name__ == "__main__":
             args=args,
         )
 
-        stats = jax.tree.map(float, stats)
-        for stat, value in stats.items():
-            writer.add_scalar(f"loss/{stat}", value, global_step)
+        write_stats(writer, stats, global_step)
 
     env.close()
     writer.close()

@@ -19,7 +19,7 @@ sns.set_theme(style="whitegrid")
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 key = jr.key(1)
 
@@ -136,7 +136,7 @@ def train(
     xs: Array,
     zs: Array,
     epochs: int,
-    debug: bool = False,
+    debug: bool = True,
 ) -> tuple[Array, CPGNeuralActor, optax.OptState]:
     arr, static = eqx.partition(model, eqx.is_array)
 
@@ -168,7 +168,7 @@ def train(
 
 
 losses, model, opt_state = train(
-    model, opt_state, ts_train, ys_train[0], xs_train, zs_train, epochs, debug=True
+    model, opt_state, ts_train, ys_train[0], xs_train, zs_train, epochs
 )
 
 plt.figure(figsize=(10, 6))
