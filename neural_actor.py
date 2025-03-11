@@ -14,7 +14,7 @@ VF = TypeVar("VF", bound="AbstractVectorField")
 OM = TypeVar("OM", bound="AbstractOutputMapping")
 
 
-class AbstractVectorField(eqx.Module):
+class AbstractVectorField(eqx.Module, strict=True):
     """Abstract module to compute the vector field of a dynamical system."""
 
     state_shape: eqx.AbstractVar[int]
@@ -25,7 +25,7 @@ class AbstractVectorField(eqx.Module):
         raise NotImplementedError
 
 
-class AbstractOutputMapping(eqx.Module):
+class AbstractOutputMapping(eqx.Module, strict=True):
     """Abstract module to map a system's state to an actor output."""
 
     @abstractmethod
@@ -34,7 +34,7 @@ class AbstractOutputMapping(eqx.Module):
         raise NotImplementedError
 
 
-class AbstractNeuralActor(eqx.Module, Generic[VF, OM]):
+class AbstractNeuralActor(eqx.Module, Generic[VF, OM], strict=True):
     """Abstract module to represent a neural actor model.
 
     Neural actor models are dynamical systems with external input and output mapping.

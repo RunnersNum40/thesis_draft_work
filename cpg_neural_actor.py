@@ -101,7 +101,7 @@ def cpg_output(state: ArrayLike, num_oscillators: int) -> Array:
     return jnp.concatenate([amplitudes * jnp.cos(phases), amplitudes * jnp.sin(phases)])
 
 
-class ForcedCPG(AbstractVectorField):
+class ForcedCPG(AbstractVectorField, strict=True):
     """Parameterized CPG vector field with an external input."""
 
     num_oscillators: int
@@ -136,13 +136,13 @@ class ForcedCPG(AbstractVectorField):
         )
 
     def __call__(self, t: float, y: Array, x: Array) -> Array:
-        params = self.input_mapping(jnp.concatenate([x, jnp.array([t]), y]))
+        params = self.input_mapping(jnp.concatenate([x, jnp.asarray([t]), y]))
         return cpg_vector_field(
             self.num_oscillators, self.convergence_factor, t, y, params
         )
 
 
-class CPGOutputMap(AbstractOutputMapping):
+class CPGOutputMap(AbstractOutputMapping, strict=True):
     """Map a CPG state to an output."""
 
     num_oscillators: int
@@ -174,7 +174,7 @@ class CPGOutputMap(AbstractOutputMapping):
         return self.output_mapping(cpg_output(y, self.num_oscillators))
 
 
-class CPGNeuralActor(AbstractNeuralActor[ForcedCPG, CPGOutputMap]):
+class CPGNeuralActor(AbstractNeuralActor[ForcedCPG, CPGOutputMap], strict=True):
     """Neural actor with a CPG inductive bias"""
 
     num_oscillators: int
