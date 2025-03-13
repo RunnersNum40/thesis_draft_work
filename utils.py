@@ -1,13 +1,15 @@
+from typing import Literal
+
 import equinox as eqx
 from jax import Array
 from jax import random as jr
 
 
 def mlp_with_final_layer_std(
-    in_size: int,
+    in_size: int | Literal["scalar"],
     width_size: int,
     depth: int,
-    out_size: int,
+    out_size: int | Literal["scalar"],
     std: float,
     key: Array,
     *args,
