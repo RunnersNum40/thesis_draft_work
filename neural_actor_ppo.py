@@ -129,12 +129,10 @@ class Agent(eqx.Module):
             jnp.asarray(env.action_space(env_params).shape).prod()
         )
 
-    @eqx.filter_jit
     def get_value(self, x: Array, state: Array, ts: Array) -> Array:
         state, x = self.preprocessing(ts, state, x, max_steps=2**14)
         return self.critic(x)
 
-    @eqx.filter_jit
     def get_action_and_value(
         self, x: Array, state: Array, ts: Array, key: Array
     ) -> tuple[Array, Array, Array, Array, Array]:
@@ -155,7 +153,6 @@ class Agent(eqx.Module):
             value,
         )
 
-    @eqx.filter_jit
     def get_action_value(
         self, x: Array, state: Array, ts: Array, action: Array
     ) -> tuple[Array, Array, Array]:
@@ -272,7 +269,6 @@ def get_batch_indices(batch_size: int, data_size: int, key: Array) -> jnp.ndarra
     return perm[: num_batches * batch_size].reshape(num_batches, batch_size)
 
 
-@eqx.filter_jit
 def training_step(
     agent: Agent,
     opt_state: optax.OptState,
@@ -396,7 +392,6 @@ def log_info(writer: SummaryWriter, info: dict[str, Array], global_step: Array) 
     )
 
 
-@eqx.filter_jit
 def rollout(
     env: environment.Environment | wrappers.LogWrapper,
     env_params: environment.EnvParams,
@@ -432,11 +427,11 @@ def rollout(
         )
 
     def reset(key: Array, env_state: Array) -> tuple[Array, Array, Array, Array]:
-        key, env_state_key = jr.split(key)
+        env_state_key, agent_state_key = jr.split(key)
         next_obs, env_state = env.reset(env_state_key, env_params)
-        key, agent_state_key = jr.split(key)
         agent_state = agent.initial_state(agent_state_key)
         agent_time = jnp.array(0.0)
+        # Fix the state typing
         env_state = eqx.tree_at(
             lambda s: s.episode_returns,
             env_state,
@@ -498,7 +493,7 @@ def rollout(
             operand=None,
         )
 
-        new_carry = {
+        carry = {
             "key": key,
             "env_state": env_state,
             "agent_state": agent_state,
@@ -507,7 +502,7 @@ def rollout(
             "next_done": next_done,
             "global_step": global_step,
         }
-        step_output = {
+        output = {
             "observations": out_observation,
             "states": out_state,
             "times": out_time,
@@ -517,7 +512,7 @@ def rollout(
             "dones": next_done,
             "values": value,
         }
-        return new_carry, step_output
+        return carry, output
 
     training_states, rollouts = jax.lax.scan(
         rollout_step, training_states, None, length=args.num_steps
@@ -525,7 +520,6 @@ def rollout(
     return training_states, rollouts
 
 
-@eqx.filter_jit
 def write_stats(
     writer: SummaryWriter,
     logger: logging.Logger,
@@ -553,6 +547,44 @@ def write_stats(
             global_step,
             ordered=True,
         )
+
+
+@eqx.filter_jit
+def iteration(
+    env: environment.Environment | wrappers.LogWrapper,
+    env_params: environment.EnvParams,
+    agent: Agent,
+    optimizer: optax.GradientTransformation,
+    opt_state: optax.OptState,
+    training_states: dict[str, Array],
+    key: Array,
+) -> tuple[Agent, optax.OptState, dict[str, Array]]:
+    training_states, rollouts = rollout(
+        env=env,
+        env_params=env_params,
+        agent=agent,
+        training_states=training_states,
+        args=args,
+        writer=writer,
+    )
+
+    agent, opt_state, stats = training_step(
+        agent=agent,
+        opt_state=opt_state,
+        optimizer=optimizer,
+        training_states=training_states,
+        rollouts=rollouts,
+        args=args,
+        key=key,
+    )
+
+    write_stats(writer, logger, stats, training_states["global_step"])
+
+    return (
+        agent,
+        opt_state,
+        training_states,
+    )
 
 
 if __name__ == "__main__":
@@ -604,28 +636,16 @@ if __name__ == "__main__":
     }
 
     with logging_redirect_tqdm():
-        for iteration in trange(1, args.num_iterations + 1, desc="Training"):
-            training_states, rollouts = rollout(
+        for _ in trange(1, args.num_iterations + 1, desc="Training"):
+            key, iteration_key = jr.split(key)
+            agent, opt_state, training_states = iteration(
                 env=env,
                 env_params=env_params,
                 agent=agent,
-                training_states=training_states,
-                args=args,
-                writer=writer,
-            )
-
-            key, training_key = jr.split(key)
-            agent, opt_state, stats = training_step(
-                agent=agent,
-                opt_state=opt_state,
                 optimizer=optimizer,
+                opt_state=opt_state,
                 training_states=training_states,
-                rollouts=rollouts,
-                args=args,
-                key=training_key,
+                key=iteration_key,
             )
 
-            write_stats(writer, logger, stats, training_states["global_step"])
-
-    env.close()
     writer.close()
