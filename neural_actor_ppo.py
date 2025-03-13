@@ -1,3 +1,4 @@
+import logging
 import os
 import random
 import time
@@ -14,7 +15,7 @@ from jax import numpy as jnp
 from jax import random as jr
 from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import trange
-import logging
+from tqdm.contrib.logging import logging_redirect_tqdm
 
 from unbiased_neural_actor import UnbiasedNeuralActor
 from utils import mlp_with_final_layer_std
@@ -509,55 +510,56 @@ if __name__ == "__main__":
     agent_state = agent.initial_state(state_key)
     agent_time = jnp.array(0.0)
 
-    for iteration in trange(1, args.num_iterations + 1, desc="Training"):
-        key, rollout_key = jr.split(key)
-        (
-            agent_state,
-            agent_time,
-            next_observation,
-            next_done,
-            global_step,
-            observations,
-            states,
-            times,
-            actions,
-            log_probs,
-            rewards,
-            dones,
-            values,
-        ) = rollout(
-            env,
-            agent,
-            agent_state,
-            agent_time,
-            next_observation,
-            next_done,
-            global_step,
-            args,
-            writer,
-            rollout_key,
-        )
+    with logging_redirect_tqdm():
+        for iteration in trange(1, args.num_iterations + 1, desc="Training"):
+            key, rollout_key = jr.split(key)
+            (
+                agent_state,
+                agent_time,
+                next_observation,
+                next_done,
+                global_step,
+                observations,
+                states,
+                times,
+                actions,
+                log_probs,
+                rewards,
+                dones,
+                values,
+            ) = rollout(
+                env,
+                agent,
+                agent_state,
+                agent_time,
+                next_observation,
+                next_done,
+                global_step,
+                args,
+                writer,
+                rollout_key,
+            )
 
-        key, training_key = jr.split(key)
-        agent, opt_state, stats = training_step(
-            agent=agent,
-            opt_state=opt_state,
-            optimizer=optimizer,
-            key=training_key,
-            next_observation=next_observation,
-            next_done=next_done,
-            dones=dones,
-            rewards=rewards,
-            observations=observations,
-            states=states,
-            times=times,
-            actions=actions,
-            values=values,
-            log_probs=log_probs,
-            args=args,
-        )
+            key, training_key = jr.split(key)
+            agent, opt_state, stats = training_step(
+                agent=agent,
+                opt_state=opt_state,
+                optimizer=optimizer,
+                key=training_key,
+                next_observation=next_observation,
+                next_done=next_done,
+                dones=dones,
+                rewards=rewards,
+                observations=observations,
+                states=states,
+                times=times,
+                actions=actions,
+                values=values,
+                log_probs=log_probs,
+                args=args,
+            )
 
-        write_stats(writer, stats, global_step)
+            write_stats(writer, stats, global_step)
 
     env.close()
     writer.close()
