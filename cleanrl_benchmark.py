@@ -25,7 +25,7 @@ class Args:
     """if toggled, cuda will be enabled by default"""
 
     # Algorithm specific arguments
-    env_id: str = "InvertedPendulum-v5"
+    env_id: str = "Pendulum-v1"
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
@@ -69,21 +69,13 @@ class Args:
     """the number of iterations (computed in runtime)"""
 
 
-def make_env(env_id, gamma):
+def make_env(env_id):
     def thunk():
         env = gym.make(env_id)
-        env = gym.wrappers.FlattenObservation(
-            env
-        )  # deal with dm_control's Dict observation space
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
-        env = gym.wrappers.NormalizeObservation(env)
         env = gym.wrappers.TransformObservation(
-            env, lambda obs: np.clip(obs, -10, 10), env.observation_space
-        )
-        env = gym.wrappers.NormalizeReward(env, gamma=gamma)
-        env = gym.wrappers.TransformReward(
-            env, lambda reward: np.clip(float(reward), -10, 10)
+            env, lambda o: o[:2], gym.spaces.Box(-np.inf, np.inf, (2,))
         )
         return env
 
@@ -166,7 +158,7 @@ if __name__ == "__main__":
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id, args.gamma) for i in range(args.num_envs)]
+        [make_env(args.env_id) for i in range(args.num_envs)]
     )
     assert isinstance(
         envs.single_action_space, gym.spaces.Box

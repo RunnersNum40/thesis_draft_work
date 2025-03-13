@@ -3,6 +3,8 @@ from jax import Array
 from jax import numpy as jnp
 from jax.typing import ArrayLike
 
+from utils import mlp_with_final_layer_std
+
 
 class FakeNeuralActor:
     mlp: eqx.nn.MLP
@@ -14,16 +16,20 @@ class FakeNeuralActor:
         width_size: int,
         depth: int,
         out_size: int,
-        *,
         key: Array,
+        *args,
+        **kwargs,
     ) -> None:
         self.state_shape = (1,)
-        self.mlp = eqx.nn.MLP(
+        self.mlp = mlp_with_final_layer_std(
             in_size=in_size,
             width_size=width_size,
             depth=depth,
             out_size=out_size,
+            std=0.01,
             key=key,
+            *args,
+            **kwargs,
         )
 
     def __call__(

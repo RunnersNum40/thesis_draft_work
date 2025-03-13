@@ -4,6 +4,7 @@ from jax import Array
 from jax import numpy as jnp
 
 from neural_actor import AbstractNeuralActor, AbstractOutputMapping, AbstractVectorField
+from utils import mlp_with_final_layer_std
 
 
 class UnbiasedField(AbstractVectorField):
@@ -47,11 +48,12 @@ class UnbiasedMap(AbstractOutputMapping):
         *,
         key: Array,
     ) -> None:
-        self.map = eqx.nn.MLP(
+        self.map = mlp_with_final_layer_std(
             in_size=state_shape,
             width_size=width_size,
             depth=depth,
             out_size=out_size,
+            std=0.01,
             key=key,
         )
 

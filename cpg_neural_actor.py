@@ -8,6 +8,7 @@ from jax import random as jr
 from jax.typing import ArrayLike
 
 from neural_actor import AbstractNeuralActor, AbstractOutputMapping, AbstractVectorField
+from utils import mlp_with_final_layer_std
 
 
 def split_states(states: ArrayLike, num_oscillators: int) -> tuple[Array, Array, Array]:
@@ -163,11 +164,12 @@ class CPGOutputMap(AbstractOutputMapping, strict=True):
         self.output_shape = (
             2 * num_oscillators
         )  # The naming might be misleading as the output shape is actually the input shape
-        self.output_mapping = eqx.nn.MLP(
+        self.output_mapping = mlp_with_final_layer_std(
             in_size=self.output_shape,
             out_size=output_size,
             width_size=output_mapping_width,
             depth=output_mapping_depth,
+            std=0.01,
             key=key,
         )
 
@@ -196,7 +198,7 @@ class CPGNeuralActor(AbstractNeuralActor[ForcedCPG, CPGOutputMap], strict=True):
         *,
         key: Array,
     ) -> None:
-        input_key, output_key = jax.random.split(key)
+        input_key, output_key = jr.split(key)
 
         self.num_oscillators = num_oscillators
         self.convergence_factor = convergence_factor

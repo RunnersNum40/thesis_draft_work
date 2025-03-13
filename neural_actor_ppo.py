@@ -16,6 +16,7 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import trange
 
 from unbiased_neural_actor import UnbiasedNeuralActor
+from utils import mlp_with_final_layer_std
 
 
 @dataclass
@@ -76,97 +77,101 @@ class Args:
 
 class Agent(eqx.Module):
     critic: eqx.nn.MLP
-    actor_mean: UnbiasedNeuralActor
+    actor_mean: eqx.nn.MLP
     actor_logstd: Array
+    preprocessing: UnbiasedNeuralActor
 
-    def __init__(self, env: gym.Env, *, key: Array, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, env: gym.Env, *, key: Array):
+        state_size = 4
 
-        assert isinstance(env.observation_space, gym.spaces.Box)
-        assert isinstance(env.action_space, gym.spaces.Box)
-
-        critic_key, actor_mean_key = jr.split(key)
-        self.critic = eqx.nn.MLP(
-            in_size=int(jnp.asarray(env.observation_space.shape).prod()),
-            out_size=1,
+        preprocessing_key, critic_key, actor_mean_key = jr.split(key, 3)
+        self.preprocessing = UnbiasedNeuralActor(
+            state_shape=state_size,
+            input_size=int(jnp.asarray(env.observation_space.shape).prod()),
+            input_mapping_width=64,
+            input_mapping_depth=3,
+            output_size=state_size,
+            output_mapping_width=0,
+            output_mapping_depth=0,
+            key=preprocessing_key,
+        )
+        self.critic = mlp_with_final_layer_std(
+            in_size=state_size,
+            out_size="scalar",
             width_size=64,
-            depth=1,
+            depth=3,
+            std=1.0,
             activation=jax.nn.tanh,
             key=critic_key,
         )
-        self.actor_mean = UnbiasedNeuralActor(
-            state_shape=16,
-            input_size=int(jnp.asarray(env.observation_space.shape).prod()),
-            input_mapping_width=64,
-            input_mapping_depth=2,
-            output_size=int(jnp.asarray(env.action_space.shape).prod()),
-            output_mapping_width=64,
-            output_mapping_depth=2,
+        self.actor_mean = mlp_with_final_layer_std(
+            in_size=state_size,
+            out_size=int(jnp.asarray(env.action_space.shape).prod()),
+            width_size=64,
+            depth=3,
+            std=0.01,
+            activation=jax.nn.tanh,
             key=actor_mean_key,
         )
         self.actor_logstd = jnp.zeros(jnp.asarray(env.action_space.shape).prod())
 
     @eqx.filter_jit
-    def get_value(self, x: Array) -> Array:
-        return self.critic(x).squeeze()
+    def get_value(self, x: Array, state: Array, ts: Array) -> Array:
+        state, x = self.preprocessing(ts, state, x, max_steps=2**14)
+        return self.critic(x)
 
     @eqx.filter_jit
     def get_action_and_value(
         self, x: Array, state: Array, ts: Array, key: Array
     ) -> tuple[Array, Array, Array, Array, Array]:
-        assert ts.shape == (2,)
-        assert (
-            state.shape == self.actor_mean.state_shape
-        ), f"{state.shape=}, {self.actor_mean.state_shape=}"
-
-        state, action_mean = self.actor_mean(ts, state, x, max_steps=2**14)
-        assert action_mean is not None
+        state, x = self.preprocessing(ts, state, x, max_steps=2**14)
+        action_mean = self.actor_mean(x)
+        value = self.critic(x)
 
         action_std = jnp.exp(self.actor_logstd)
         action = jr.normal(key, action_mean.shape) * action_std + action_mean
-        logprob = jax.scipy.stats.norm.logpdf(action, action_mean, action_std)
-        entropy = 0.5 * (jnp.log(2 * jnp.pi * action_std**2) + 1)
+        logprob = jnp.sum(jax.scipy.stats.norm.logpdf(action, action_mean, action_std))
+        entropy = jnp.sum(0.5 * (jnp.log(2 * jnp.pi * action_std**2) + 1))
 
         return (
             state,
             action,
-            logprob.sum(),
-            entropy.sum(),
-            self.get_value(x),
+            logprob,
+            entropy,
+            value,
         )
 
     @eqx.filter_jit
     def get_action_value(
         self, x: Array, state: Array, ts: Array, action: Array
     ) -> tuple[Array, Array, Array]:
-        assert ts.shape == (2,)
-        assert state.shape == self.actor_mean.state_shape
-
-        state, action_mean = self.actor_mean(ts, state, x, max_steps=2**14)
-        assert action_mean is not None
+        state, x = self.preprocessing(ts, state, x, max_steps=2**14)
+        action_mean = self.actor_mean(x)
+        value = self.critic(x)
 
         action_std = jnp.exp(self.actor_logstd)
-        logprob = jax.scipy.stats.norm.logpdf(action, action_mean, action_std)
-        entropy = 0.5 * (jnp.log(2 * jnp.pi * action_std**2) + 1)
+        logprob = jnp.sum(jax.scipy.stats.norm.logpdf(action, action_mean, action_std))
+        entropy = jnp.sum(0.5 * (jnp.log(2 * jnp.pi * action_std**2) + 1))
 
-        return logprob.sum(), entropy.sum(), self.get_value(x)
+        return logprob, entropy, value
 
     def initial_state(self, key: Array) -> Array:
-        return self.actor_mean.initial_state(key)
+        return self.preprocessing.initial_state(key)
+
+    @property
+    def state_shape(self):
+        return self.preprocessing.state_shape
 
 
 def compute_gae(
-    agent: Agent,
-    next_observation: Array,
     next_done: Array,
+    next_value: Array,
     rewards: Array,
     values: Array,
     dones: Array,
     args: Args,
 ) -> tuple[Array, Array]:
-    next_value = agent.critic(next_observation)
-
-    next_values = jnp.concatenate([values[1:], next_value], axis=0)
+    next_values = jnp.concatenate([values[1:], jnp.expand_dims(next_value, 0)], axis=0)
     next_non_terminal = jnp.concatenate(
         [1.0 - dones[1:], jnp.array([1.0 - next_done], dtype=rewards.dtype)], axis=0
     )
@@ -271,8 +276,9 @@ def training_step(
     log_probs: Array,
     args: Args,
 ) -> tuple[Agent, optax.OptState, dict[str, Array]]:
+    next_value = agent.get_value(next_observation, states[-1], times[-1])
     advantages, returns = compute_gae(
-        agent, next_observation, next_done, rewards, values, dones, args
+        next_done, next_value, rewards, values, dones, args
     )
 
     observations, states, times, actions, advantages, returns, values, log_probs = (
@@ -368,7 +374,7 @@ def rollout(
     key: Array,
 ):
     observations = jnp.zeros((args.num_steps,) + env.observation_space.shape)
-    states = jnp.zeros((args.num_steps,) + agent.actor_mean.state_shape)
+    states = jnp.zeros((args.num_steps,) + agent.state_shape)
     times = jnp.zeros((args.num_steps, 2))
     actions = jnp.zeros((args.num_steps,) + env.action_space.shape)
     log_probs = jnp.zeros((args.num_steps,))
@@ -465,8 +471,9 @@ if __name__ == "__main__":
     env = gym.make(args.env_id)
     env = gym.wrappers.RecordEpisodeStatistics(env)
     env = gym.wrappers.ClipAction(env)
-    env = gym.wrappers.NormalizeObservation(env)
-    env = gym.wrappers.NormalizeReward(env, gamma=args.gamma)
+    env = gym.wrappers.TransformObservation(
+        env, lambda o: o[:2], gym.spaces.Box(-np.inf, np.inf, (2,))
+    )
     assert isinstance(
         env.observation_space, gym.spaces.Box
     ), "only continuous observation space is supported"
