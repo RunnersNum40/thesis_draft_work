@@ -463,70 +463,102 @@ def rollout(
 
         return next_observation, env_state, agent_state, agent_time
 
-    observations = jnp.zeros(
-        (args.num_steps,) + env.observation_space(env_params).shape
-    )
-    states = jnp.zeros((args.num_steps,) + agent.state_shape)
-    times = jnp.zeros((args.num_steps, 2))
-    actions = jnp.zeros((args.num_steps,) + env.action_space(env_params).shape)
-    log_probs = jnp.zeros((args.num_steps,))
-    rewards = jnp.zeros((args.num_steps,))
-    dones = jnp.zeros((args.num_steps,))
-    values = jnp.zeros((args.num_steps,))
-
-    for step in range(args.num_steps):
-        global_step += 1
-
-        # Store the current state
-        ts = jnp.array([agent_time, agent_time + args.actor_timestep])
-        observations = observations.at[step].set(next_observation)
-        states = states.at[step].set(agent_state)
-        times = times.at[step].set(ts)
-        dones = dones.at[step].set(next_done)
-        agent_time = ts[1]
-
-        # Get the action and value
-        key, action_key = jr.split(key)
-        agent_state, action, log_prob, _, value = agent.get_action_and_value(
-            next_observation, agent_state, ts, action_key
+    def rollout_step(carry, _):
+        key, env_state, agent_state, agent_time, next_obs, next_done, global_step = (
+            carry
         )
-        values = values.at[step].set(value)
-        actions = actions.at[step].set(action)
-        log_probs = log_probs.at[step].set(log_prob)
+        global_step += 1
+        ts = jnp.array([agent_time, agent_time + args.actor_timestep])
+        out_obs = next_obs
+        out_state = agent_state
+        out_time = ts
 
-        # Step the environment
+        key, action_key = jr.split(key)
+        agent_state_new, action, log_prob, _, value = agent.get_action_and_value(
+            next_obs, agent_state, ts, action_key
+        )
         action = jnp.clip(
             action, env.action_space(env_params).low, env.action_space(env_params).high
         )
-        key, env_state_key = jr.split(key)
-        next_observation, env_state, reward, next_done, info = env.step(
-            env_state_key, env_state, action, env_params
-        )
-        rewards = rewards.at[step].set(reward)
 
-        # Log the episode information
+        key, env_step_key = jr.split(key)
+        next_obs_new, env_state_new, reward, next_done_new, info = env.step(
+            env_step_key, env_state, action, env_params
+        )
+
+        key, _ = jr.split(key)
         jax.lax.cond(
             info["returned_episode"],
-            log_info,
-            lambda *args, **kwargs: None,
-            info,
+            lambda _: log_info(info, global_step),
+            lambda _: None,
+            operand=None,
+        )
+
+        new_agent_time = ts[1]
+        key, reset_key = jr.split(key)
+        next_obs_final, env_state_final, agent_state_final, agent_time_final = (
+            jax.lax.cond(
+                next_done_new,
+                lambda _: reset(reset_key, env_state_new),
+                lambda _: (
+                    next_obs_new,
+                    env_state_new,
+                    agent_state_new,
+                    new_agent_time,
+                ),
+                operand=None,
+            )
+        )
+        next_done_final = jax.lax.cond(
+            next_done_new,
+            lambda _: jnp.array(False),
+            lambda _: next_done_new,
+            operand=None,
+        )
+
+        new_carry = (
+            key,
+            env_state_final,
+            agent_state_final,
+            agent_time_final,
+            next_obs_final,
+            next_done_final,
             global_step,
         )
-
-        key, reset_key = jr.split(key)
-        next_observation, env_state, agent_state, agent_time = jax.lax.cond(
-            next_done,
-            reset,
-            lambda *args, **kwargs: (
-                next_observation,
-                env_state,
-                agent_state,
-                agent_time,
-            ),
-            reset_key,
-            env_state,
+        step_output = (
+            out_obs,
+            out_state,
+            out_time,
+            action,
+            log_prob,
+            reward,
+            next_done_new,
+            value,
         )
+        return new_carry, step_output
 
+    initial_carry = (
+        key,
+        env_state,
+        agent_state,
+        agent_time,
+        next_observation,
+        next_done,
+        global_step,
+    )
+    carry, outputs = jax.lax.scan(
+        rollout_step, initial_carry, None, length=args.num_steps
+    )
+    observations, states, times, actions, log_probs, rewards, dones, values = outputs
+    (
+        key,
+        env_state,
+        agent_state,
+        agent_time,
+        next_observation,
+        next_done,
+        global_step,
+    ) = carry
     return (
         env_state,
         agent_state,
@@ -594,7 +626,7 @@ if __name__ == "__main__":
     opt_state = optimizer.init(eqx.filter(agent, eqx.is_inexact_array))
 
     global_step = jnp.array(0)
-    next_done = jnp.array(0)
+    next_done = jnp.array(False)
 
     key, env_key = jr.split(key)
     next_observation, env_state = env.reset(env_key, env_params)
