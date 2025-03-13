@@ -22,7 +22,7 @@ from utils import mlp_with_final_layer_std
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 @dataclass
@@ -34,7 +34,7 @@ class Args:
 
     env_id: str = "Pendulum-v1"
     """the id of the environment"""
-    total_timesteps: int = 1000000
+    total_timesteps: int = 10000000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
@@ -587,6 +587,63 @@ def iteration(
     )
 
 
+@eqx.filter_jit
+def evaluate(
+    env: environment.Environment | wrappers.LogWrapper,
+    env_params: environment.EnvParams,
+    agent: Agent,
+    args: Args,
+    key: Array,
+    max_steps: int = 1000,
+) -> Array:
+    key, env_state_key, agent_state_key, key = jr.split(key, 4)
+    next_obs, env_state = env.reset(env_state_key, env_params)
+    agent_state = agent.initial_state(agent_state_key)
+
+    state = {
+        "key": key,
+        "env_state": env_state,
+        "agent_state": agent_state,
+        "agent_time": jnp.array(0.0),
+        "next_obs": next_obs,
+        "total_reward": jnp.array(0.0),
+        "done": jnp.array(False),
+        "steps": jnp.array(0),
+    }
+
+    def cond_fun(s):
+        return jnp.logical_and(s["steps"] < max_steps, jnp.logical_not(s["done"]))
+
+    def body_fun(s):
+        keys = jr.split(s["key"], 3)
+        new_key, action_key, step_key = keys[0], keys[1], keys[2]
+        ts = jnp.array([s["agent_time"], s["agent_time"] + args.actor_timestep])
+        new_agent_state, action, _, _, _ = agent.get_action_and_value(
+            s["next_obs"], s["agent_state"], ts, action_key
+        )
+        action = jnp.clip(
+            action,
+            env.action_space(env_params).low,
+            env.action_space(env_params).high,
+        )
+        next_obs, new_env_state, reward, done, _ = env.step(
+            step_key, s["env_state"], action, env_params
+        )
+        return {
+            "key": new_key,
+            "env_state": new_env_state,
+            "agent_state": new_agent_state,
+            "agent_time": ts[1],
+            "next_obs": next_obs,
+            "total_reward": s["total_reward"] + reward,
+            "done": done,
+            "steps": s["steps"] + 1,
+        }
+
+    final_state = jax.lax.while_loop(cond_fun, body_fun, state)
+    return final_state["total_reward"]
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_steps)
@@ -649,3 +706,11 @@ if __name__ == "__main__":
             )
 
     writer.close()
+
+    key, eval_key = jr.split(key)
+    score = jnp.mean(
+        jax.vmap(evaluate, in_axes=(None, None, None, None, 0))(
+            env, env_params, agent, args, jr.split(eval_key, 10)
+        )
+    )
+    logger.info(f"Score: {score}")
