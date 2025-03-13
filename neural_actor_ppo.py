@@ -14,9 +14,14 @@ from jax import numpy as jnp
 from jax import random as jr
 from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import trange
+import logging
 
 from unbiased_neural_actor import UnbiasedNeuralActor
 from utils import mlp_with_final_layer_std
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 @dataclass
@@ -406,6 +411,7 @@ def rollout(
         next_done = jnp.asarray(int(termination or truncation))
 
         if "episode" in info:
+            logger.debug(f"Episode finished with reward {info['episode']['r']}")
             writer.add_scalar("episode/reward", info["episode"]["r"], global_step)
             writer.add_scalar("episode/length", info["episode"]["l"], global_step)
             writer.add_scalar("episode/time", info["episode"]["t"], global_step)
