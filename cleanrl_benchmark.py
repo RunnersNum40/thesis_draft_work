@@ -328,11 +328,11 @@ if __name__ == "__main__":
         writer.add_scalar(
             "loss/learning_rate", optimizer.param_groups[0]["lr"], global_step
         )
+        writer.add_scalar("loss/total", loss.item(), global_step)
         writer.add_scalar("loss/value", v_loss.item(), global_step)
         writer.add_scalar("loss/policy", pg_loss.item(), global_step)
         writer.add_scalar("loss/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar("loss/approx_kl", approx_kl.item(), global_step)
-        writer.add_scalar("loss/clipfrac", np.mean(clipfracs), global_step)
+        writer.add_scalar("loss/kl", approx_kl.item(), global_step)
         writer.add_scalar("loss/explained_variance", explained_var, global_step)
 
     envs.close()
