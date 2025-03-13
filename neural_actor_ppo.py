@@ -1,13 +1,11 @@
 import logging
 import os
-import random
 import time
 from dataclasses import dataclass
 
 import equinox as eqx
-import gymnasium as gym
+import gymnax as gym
 import jax
-import numpy as np
 import optax
 import tyro
 from jax import Array
@@ -16,6 +14,8 @@ from jax import random as jr
 from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import trange
 from tqdm.contrib.logging import logging_redirect_tqdm
+from gymnax import wrappers
+from gymnax.environments import environment, spaces
 
 from unbiased_neural_actor import UnbiasedNeuralActor
 from utils import mlp_with_final_layer_std
@@ -87,13 +87,19 @@ class Agent(eqx.Module):
     actor_logstd: Array
     preprocessing: UnbiasedNeuralActor
 
-    def __init__(self, env: gym.Env, *, key: Array):
+    def __init__(
+        self,
+        env: environment.Environment | wrappers.LogWrapper,
+        env_params: environment.EnvParams,
+        *,
+        key: Array,
+    ):
         state_size = 4
 
         preprocessing_key, critic_key, actor_mean_key = jr.split(key, 3)
         self.preprocessing = UnbiasedNeuralActor(
             state_shape=state_size,
-            input_size=int(jnp.asarray(env.observation_space.shape).prod()),
+            input_size=int(jnp.asarray(env.observation_space(env_params).shape).prod()),
             input_mapping_width=64,
             input_mapping_depth=3,
             output_size=state_size,
@@ -112,14 +118,16 @@ class Agent(eqx.Module):
         )
         self.actor_mean = mlp_with_final_layer_std(
             in_size=state_size,
-            out_size=int(jnp.asarray(env.action_space.shape).prod()),
+            out_size=int(jnp.asarray(env.action_space(env_params).shape).prod()),
             width_size=64,
             depth=3,
             std=0.01,
             activation=jax.nn.tanh,
             key=actor_mean_key,
         )
-        self.actor_logstd = jnp.zeros(jnp.asarray(env.action_space.shape).prod())
+        self.actor_logstd = jnp.zeros(
+            jnp.asarray(env.action_space(env_params).shape).prod()
+        )
 
     @eqx.filter_jit
     def get_value(self, x: Array, state: Array, ts: Array) -> Array:
@@ -367,22 +375,100 @@ def training_step(
     return agent, opt_state, stats
 
 
+def log_info(writer: SummaryWriter, info: dict[str, Array], global_step: Array) -> None:
+    r = info["returned_episode_returns"]
+    l = info["returned_episode_lengths"]
+    jax.debug.callback(
+        lambda r, l: logger.debug(f"Episode finished with reward {r} and length {l}"),
+        r,
+        l,
+        ordered=True,
+    )
+    jax.debug.callback(
+        lambda r, global_step: writer.add_scalar(
+            "episode/reward", float(r), int(global_step)
+        ),
+        r,
+        global_step,
+    )
+    jax.debug.callback(
+        lambda l, global_step: writer.add_scalar(
+            "episode/length", float(l), int(global_step)
+        ),
+        l,
+        global_step,
+    )
+
+
+@eqx.filter_jit
 def rollout(
-    env: gym.Env,
+    env: environment.Environment | wrappers.LogWrapper,
+    env_params: environment.EnvParams,
+    env_state: Array,
     agent: Agent,
     agent_state: Array,
     agent_time: Array,
     next_observation: Array,
     next_done: Array,
-    global_step: int,
+    global_step: Array,
     args: Args,
     writer: SummaryWriter,
     key: Array,
 ):
-    observations = jnp.zeros((args.num_steps,) + env.observation_space.shape)
+    def log_info(info: dict[str, Array], global_step: Array) -> None:
+        r = info["returned_episode_returns"]
+        l = info["returned_episode_lengths"]
+        jax.debug.callback(
+            lambda r, l: logger.debug(
+                f"Episode finished with reward {r} and length {l}"
+            ),
+            r,
+            l,
+            ordered=True,
+        )
+        jax.debug.callback(
+            lambda r, global_step: writer.add_scalar(
+                "episode/reward", float(r), int(global_step)
+            ),
+            r,
+            global_step,
+        )
+        jax.debug.callback(
+            lambda l, global_step: writer.add_scalar(
+                "episode/length", float(l), int(global_step)
+            ),
+            l,
+            global_step,
+        )
+
+    def reset(key: Array, env_state: Array) -> tuple[Array, Array, Array, Array]:
+        key, env_state_key = jr.split(key)
+        next_observation, env_state = env.reset(env_state_key, env_params)
+
+        key, agent_state_key = jr.split(key)
+        agent_state = agent.initial_state(agent_state_key)
+        agent_time = jnp.array(0.0)
+
+        # Fix the types of the episode returns
+        env_state = eqx.tree_at(
+            lambda s: s.episode_returns,
+            env_state,
+            replace_fn=lambda x: x.astype(jnp.float64),
+        )
+        env_state = eqx.tree_at(
+            lambda s: s.returned_episode_returns,
+            env_state,
+            replace_fn=lambda x: x.astype(jnp.float64),
+        )
+
+        return next_observation, env_state, agent_state, agent_time
+
+    observations = jnp.zeros(
+        (args.num_steps,) + env.observation_space(env_params).shape
+    )
     states = jnp.zeros((args.num_steps,) + agent.state_shape)
     times = jnp.zeros((args.num_steps, 2))
-    actions = jnp.zeros((args.num_steps,) + env.action_space.shape)
+    actions = jnp.zeros((args.num_steps,) + env.action_space(env_params).shape)
     log_probs = jnp.zeros((args.num_steps,))
     rewards = jnp.zeros((args.num_steps,))
     dones = jnp.zeros((args.num_steps,))
@@ -391,6 +477,7 @@ def rollout(
     for step in range(args.num_steps):
         global_step += 1
 
+        # Store the current state
         ts = jnp.array([agent_time, agent_time + args.actor_timestep])
         observations = observations.at[step].set(next_observation)
         states = states.at[step].set(agent_state)
@@ -398,6 +485,7 @@ def rollout(
         dones = dones.at[step].set(next_done)
         agent_time = ts[1]
 
+        # Get the action and value
         key, action_key = jr.split(key)
         agent_state, action, log_prob, _, value = agent.get_action_and_value(
             next_observation, agent_state, ts, action_key
@@ -406,25 +494,41 @@ def rollout(
         actions = actions.at[step].set(action)
         log_probs = log_probs.at[step].set(log_prob)
 
-        next_observation, reward, termination, truncation, info = env.step(action)
+        # Step the environment
+        action = jnp.clip(
+            action, env.action_space(env_params).low, env.action_space(env_params).high
+        )
+        key, env_state_key = jr.split(key)
+        next_observation, env_state, reward, next_done, info = env.step(
+            env_state_key, env_state, action, env_params
+        )
         rewards = rewards.at[step].set(reward)
-        next_observation = jnp.asarray(next_observation)
-        next_done = jnp.asarray(int(termination or truncation))
 
-        if "episode" in info:
-            logger.debug(f"Episode finished with reward {info['episode']['r']}")
-            writer.add_scalar("episode/reward", info["episode"]["r"], global_step)
-            writer.add_scalar("episode/length", info["episode"]["l"], global_step)
-            writer.add_scalar("episode/time", info["episode"]["t"], global_step)
+        # Log the episode information
+        jax.lax.cond(
+            info["returned_episode"],
+            log_info,
+            lambda *args, **kwargs: None,
+            info,
+            global_step,
+        )
 
-        if termination or truncation:
-            next_observation, _ = env.reset(seed=random.randint(0, 2**32 - 1))
-            next_observation = jnp.array(next_observation)
-            key, state_key = jr.split(key)
-            agent_state = agent.initial_state(state_key)
-            agent_time = jnp.array(0.0)
+        key, reset_key = jr.split(key)
+        next_observation, env_state, agent_state, agent_time = jax.lax.cond(
+            next_done,
+            reset,
+            lambda *args, **kwargs: (
+                next_observation,
+                env_state,
+                agent_state,
+                agent_time,
+            ),
+            reset_key,
+            env_state,
+        )
 
     return (
+        env_state,
         agent_state,
         agent_time,
         next_observation,
@@ -443,12 +547,12 @@ def rollout(
 
 @eqx.filter_jit
 def write_stats(
-    writer: SummaryWriter, stats: dict[str, Array], global_step: int
+    writer: SummaryWriter, stats: dict[str, Array], global_step: Array
 ) -> None:
     for stat, value in stats.items():
         jax.debug.callback(
             lambda stat, value, global_step: writer.add_scalar(
-                f"loss/{stat}", float(value), global_step
+                f"loss/{stat}", float(value), int(global_step)
             ),
             stat,
             value,
@@ -471,25 +575,13 @@ if __name__ == "__main__":
         % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    random.seed(args.seed)
-    np.random.seed(args.seed)
     key = jr.key(args.seed)
 
-    env = gym.make(args.env_id)
-    env = gym.wrappers.RecordEpisodeStatistics(env)
-    env = gym.wrappers.ClipAction(env)
-    env = gym.wrappers.TransformObservation(
-        env, lambda o: o[:2], gym.spaces.Box(-np.inf, np.inf, (2,))
-    )
-    assert isinstance(
-        env.observation_space, gym.spaces.Box
-    ), "only continuous observation space is supported"
-    assert isinstance(
-        env.action_space, gym.spaces.Box
-    ), "only continuous action space is supported"
+    env, env_params = gym.make(args.env_id)
+    env = wrappers.LogWrapper(env)
 
     key, agent_key = jr.split(key)
-    agent = Agent(env, key=agent_key)
+    agent = Agent(env, env_params, key=agent_key)
     if args.anneal_lr:
         schedule = optax.schedules.cosine_decay_schedule(
             args.learning_rate,
@@ -501,11 +593,11 @@ if __name__ == "__main__":
     optimizer = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), adam)
     opt_state = optimizer.init(eqx.filter(agent, eqx.is_inexact_array))
 
-    global_step = 0
+    global_step = jnp.array(0)
     next_done = jnp.array(0)
 
-    next_observation, _ = env.reset(seed=random.randint(0, 2**32 - 1))
-    next_observation = jnp.asarray(next_observation)
+    key, env_key = jr.split(key)
+    next_observation, env_state = env.reset(env_key, env_params)
     key, state_key = jr.split(key)
     agent_state = agent.initial_state(state_key)
     agent_time = jnp.array(0.0)
@@ -514,6 +606,7 @@ if __name__ == "__main__":
         for iteration in trange(1, args.num_iterations + 1, desc="Training"):
             key, rollout_key = jr.split(key)
             (
+                env_state,
                 agent_state,
                 agent_time,
                 next_observation,
@@ -529,6 +622,8 @@ if __name__ == "__main__":
                 values,
             ) = rollout(
                 env,
+                env_params,
+                env_state,
                 agent,
                 agent_state,
                 agent_time,
