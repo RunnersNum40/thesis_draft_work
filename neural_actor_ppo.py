@@ -1,84 +1,20 @@
 import logging
-import os
-import time
-from dataclasses import dataclass
 
 import equinox as eqx
-import gymnax as gym
 import jax
 import optax
-import tyro
 from gymnax import wrappers
 from gymnax.environments import environment
 from jax import Array
 from jax import numpy as jnp
 from jax import random as jr
 from torch.utils.tensorboard.writer import SummaryWriter
-from tqdm import trange
-from tqdm.contrib.logging import logging_redirect_tqdm
 
 from unbiased_neural_actor import UnbiasedNeuralActor
 from utils import mlp_with_final_layer_std
 
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
-
-
-@dataclass
-class Args:
-    exp_name: str = os.path.basename(__file__)[: -len(".py")]
-    """the name of this experiment"""
-    seed: int = 1
-    """seed of the experiment"""
-
-    env_id: str = "Pendulum-v1"
-    """the id of the environment"""
-    total_timesteps: int = 10000000
-    """total timesteps of the experiments"""
-    learning_rate: float = 3e-4
-    """the learning rate of the optimizer"""
-    num_envs: int = 1
-    """the number of parallel game environments"""
-    num_steps: int = 2048
-    """the number of steps to run in each environment per policy rollout"""
-    anneal_lr: bool = True
-    """Toggle learning rate annealing for policy and value networks"""
-    gamma: float = 0.99
-    """the discount factor gamma"""
-    gae_lambda: float = 0.95
-    """the lambda for the general advantage estimation"""
-    num_minibatches: int = 32
-    """the number of mini-batches"""
-    update_epochs: int = 10
-    """the K epochs to update the policy"""
-    norm_adv: bool = True
-    """Toggles advantages normalization"""
-    clip_coef: float = 0.2
-    """the surrogate clipping coefficient"""
-    clip_vloss: bool = True
-    """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.0
-    """coefficient of the entropy"""
-    vf_coef: float = 0.5
-    """coefficient of the value function"""
-    max_grad_norm: float = 0.5
-    """the maximum norm for the gradient clipping"""
-    target_kl: float | None = None
-    """the target KL divergence threshold"""
-    actor_timestep: float = 0.01
-    """the timestep for the agent internal ODE"""
-
-    # to be filled in runtime
-    batch_size: int = 0
-    """the batch size (computed in runtime)"""
-    minibatch_size: int = 0
-    """the mini-batch size (computed in runtime)"""
-    num_iterations: int = 0
-    """the number of iterations (computed in runtime)"""
-
-    def __hash__(self):
-        return hash(frozenset(vars(self).items()))
 
 
 class Agent(eqx.Module):
@@ -180,7 +116,7 @@ def compute_gae(
     rewards: Array,
     values: Array,
     dones: Array,
-    args: Args,
+    args,
 ) -> tuple[Array, Array]:
     next_values = jnp.concatenate([values[1:], jnp.expand_dims(next_value, 0)], axis=0)
     next_non_terminal = jnp.concatenate(
@@ -220,7 +156,7 @@ def loss_grad(
     returns: Array,
     values: Array,
     log_probs: Array,
-    args: Args,
+    args,
 ) -> tuple[Array, dict[str, Array]]:
     new_log_prob, entropy, new_value = jax.vmap(agent.get_action_value)(
         observations, states, times, actions
@@ -269,14 +205,14 @@ def get_batch_indices(batch_size: int, data_size: int, key: Array) -> jnp.ndarra
     return perm[: num_batches * batch_size].reshape(num_batches, batch_size)
 
 
-def training_step(
+def train_on_rollout(
     agent: Agent,
     opt_state: optax.OptState,
     optimizer: optax.GradientTransformation,
     key: Array,
     training_states: dict[str, Array],
     rollouts: dict[str, Array],
-    args: Args,
+    args,
 ) -> tuple[Agent, optax.OptState, dict[str, Array]]:
     next_value = agent.get_value(
         training_states["next_observation"],
@@ -392,12 +328,12 @@ def log_info(writer: SummaryWriter, info: dict[str, Array], global_step: Array) 
     )
 
 
-def rollout(
+def collect_rollout(
     env: environment.Environment | wrappers.LogWrapper,
     env_params: environment.EnvParams,
     agent: Agent,
     training_states: dict[str, Array],
-    args: Args,
+    args,
     writer: SummaryWriter,
 ) -> tuple[dict[str, Array], dict[str, Array]]:
     def log_info(info: dict[str, Array], global_step: Array) -> None:
@@ -549,50 +485,11 @@ def write_stats(
         )
 
 
-@eqx.filter_jit
-def iteration(
-    env: environment.Environment | wrappers.LogWrapper,
-    env_params: environment.EnvParams,
-    agent: Agent,
-    optimizer: optax.GradientTransformation,
-    opt_state: optax.OptState,
-    training_states: dict[str, Array],
-    key: Array,
-) -> tuple[Agent, optax.OptState, dict[str, Array]]:
-    training_states, rollouts = rollout(
-        env=env,
-        env_params=env_params,
-        agent=agent,
-        training_states=training_states,
-        args=args,
-        writer=writer,
-    )
-
-    agent, opt_state, stats = training_step(
-        agent=agent,
-        opt_state=opt_state,
-        optimizer=optimizer,
-        training_states=training_states,
-        rollouts=rollouts,
-        args=args,
-        key=key,
-    )
-
-    write_stats(writer, logger, stats, training_states["global_step"])
-
-    return (
-        agent,
-        opt_state,
-        training_states,
-    )
-
-
-@eqx.filter_jit
 def evaluate(
     env: environment.Environment | wrappers.LogWrapper,
     env_params: environment.EnvParams,
     agent: Agent,
-    args: Args,
+    args,
     key: Array,
     max_steps: int = 1000,
 ) -> Array:
@@ -611,15 +508,17 @@ def evaluate(
         "steps": jnp.array(0),
     }
 
-    def cond_fun(s):
-        return jnp.logical_and(s["steps"] < max_steps, jnp.logical_not(s["done"]))
+    def not_complete(state: dict[str, Array]):
+        return jnp.logical_and(
+            state["steps"] < max_steps, jnp.logical_not(state["done"])
+        )
 
-    def body_fun(s):
-        keys = jr.split(s["key"], 3)
+    def env_step(state: dict[str, Array]):
+        keys = jr.split(state["key"], 3)
         new_key, action_key, step_key = keys[0], keys[1], keys[2]
-        ts = jnp.array([s["agent_time"], s["agent_time"] + args.actor_timestep])
+        ts = jnp.array([state["agent_time"], state["agent_time"] + args.actor_timestep])
         new_agent_state, action, _, _, _ = agent.get_action_and_value(
-            s["next_obs"], s["agent_state"], ts, action_key
+            state["next_obs"], state["agent_state"], ts, action_key
         )
         action = jnp.clip(
             action,
@@ -627,7 +526,7 @@ def evaluate(
             env.action_space(env_params).high,
         )
         next_obs, new_env_state, reward, done, _ = env.step(
-            step_key, s["env_state"], action, env_params
+            step_key, state["env_state"], action, env_params
         )
         return {
             "key": new_key,
@@ -635,82 +534,10 @@ def evaluate(
             "agent_state": new_agent_state,
             "agent_time": ts[1],
             "next_obs": next_obs,
-            "total_reward": s["total_reward"] + reward,
+            "total_reward": state["total_reward"] + reward,
             "done": done,
-            "steps": s["steps"] + 1,
+            "steps": state["steps"] + 1,
         }
 
-    final_state = jax.lax.while_loop(cond_fun, body_fun, state)
+    final_state = jax.lax.while_loop(not_complete, env_step, state)
     return final_state["total_reward"]
-
-
-if __name__ == "__main__":
-    args = tyro.cli(Args)
-    args.batch_size = int(args.num_steps)
-    args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    args.num_iterations = args.total_timesteps // args.batch_size
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    print(f"Starting {run_name}")
-
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s"
-        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
-
-    key = jr.key(args.seed)
-
-    env, env_params = gym.make(args.env_id)
-    env = wrappers.LogWrapper(env)
-
-    key, agent_key = jr.split(key)
-    agent = Agent(env, env_params, key=agent_key)
-    if args.anneal_lr:
-        schedule = optax.schedules.cosine_decay_schedule(
-            args.learning_rate,
-            args.num_iterations * args.update_epochs * args.num_minibatches,
-        )
-    else:
-        schedule = optax.constant_schedule(args.learning_rate)
-    adam = optax.inject_hyperparams(optax.adam)(learning_rate=schedule)
-    optimizer = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), adam)
-    opt_state = optimizer.init(eqx.filter(agent, eqx.is_inexact_array))
-
-    key, env_key = jr.split(key)
-    next_observation, env_state = env.reset(env_key, env_params)
-    key, state_key = jr.split(key)
-
-    key, rollout_key = jr.split(key)
-    training_states = {
-        "key": rollout_key,
-        "env_state": env_state,
-        "agent_state": agent.initial_state(state_key),
-        "agent_time": jnp.array(0.0),
-        "next_observation": next_observation,
-        "next_done": jnp.array(False),
-        "global_step": jnp.array(0),
-    }
-
-    with logging_redirect_tqdm():
-        for _ in trange(1, args.num_iterations + 1, desc="Training"):
-            key, iteration_key = jr.split(key)
-            agent, opt_state, training_states = iteration(
-                env=env,
-                env_params=env_params,
-                agent=agent,
-                optimizer=optimizer,
-                opt_state=opt_state,
-                training_states=training_states,
-                key=iteration_key,
-            )
-
-    writer.close()
-
-    key, eval_key = jr.split(key)
-    score = jnp.mean(
-        jax.vmap(evaluate, in_axes=(None, None, None, None, 0))(
-            env, env_params, agent, args, jr.split(eval_key, 10)
-        )
-    )
-    logger.info(f"Score: {score}")
