@@ -303,38 +303,13 @@ def train_on_rollout(
     return agent, opt_state, stats
 
 
-def log_info(writer: SummaryWriter, info: dict[str, Array], global_step: Array) -> None:
-    r = info["returned_episode_returns"]
-    l = info["returned_episode_lengths"]
-    jax.debug.callback(
-        lambda r, l: logger.debug(f"Episode finished with reward {r} and length {l}"),
-        r,
-        l,
-        ordered=True,
-    )
-    jax.debug.callback(
-        lambda r, global_step: writer.add_scalar(
-            "episode/reward", float(r), int(global_step)
-        ),
-        r,
-        global_step,
-    )
-    jax.debug.callback(
-        lambda l, global_step: writer.add_scalar(
-            "episode/length", float(l), int(global_step)
-        ),
-        l,
-        global_step,
-    )
-
-
 def collect_rollout(
     env: environment.Environment | wrappers.LogWrapper,
     env_params: environment.EnvParams,
     agent: Agent,
     training_states: dict[str, Array],
     args,
-    writer: SummaryWriter,
+    writer: SummaryWriter | None = None,
 ) -> tuple[dict[str, Array], dict[str, Array]]:
     def log_info(info: dict[str, Array], global_step: Array) -> None:
         r = info["returned_episode_returns"]
@@ -368,16 +343,17 @@ def collect_rollout(
         agent_state = agent.initial_state(agent_state_key)
         agent_time = jnp.array(0.0)
         # Fix the state typing
-        env_state = eqx.tree_at(
-            lambda s: s.episode_returns,
-            env_state,
-            replace_fn=lambda x: x.astype(jnp.float64),
-        )
-        env_state = eqx.tree_at(
-            lambda s: s.returned_episode_returns,
-            env_state,
-            replace_fn=lambda x: x.astype(jnp.float64),
-        )
+        if isinstance(env, wrappers.LogWrapper):
+            env_state = eqx.tree_at(
+                lambda s: s.episode_returns,
+                env_state,
+                replace_fn=lambda x: x.astype(jnp.float64),
+            )
+            env_state = eqx.tree_at(
+                lambda s: s.returned_episode_returns,
+                env_state,
+                replace_fn=lambda x: x.astype(jnp.float64),
+            )
         return next_obs, env_state, agent_state, agent_time
 
     def rollout_step(carry, _):
@@ -408,12 +384,13 @@ def collect_rollout(
         )
 
         key, _ = jr.split(key)
-        jax.lax.cond(
-            info["returned_episode"],
-            lambda _: log_info(info, global_step),
-            lambda _: None,
-            operand=None,
-        )
+        if writer is not None:
+            jax.lax.cond(
+                info["returned_episode"],
+                lambda _: log_info(info, global_step),
+                lambda _: None,
+                operand=None,
+            )
 
         agent_time = ts[1]
         key, reset_key = jr.split(key)

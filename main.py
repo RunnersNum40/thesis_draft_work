@@ -9,7 +9,6 @@ import jax
 import optax
 import tyro
 from gymnax import wrappers
-from gymnax.environments import environment
 from jax import Array
 from jax import numpy as jnp
 from jax import random as jr
@@ -17,8 +16,8 @@ from torch.utils.tensorboard.writer import SummaryWriter
 
 from neural_actor_ppo import (
     Agent,
-    evaluate,
     collect_rollout,
+    evaluate,
     train_on_rollout,
     write_stats,
 )
@@ -27,7 +26,7 @@ jax.config.update("jax_enable_x64", True)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 @dataclass
@@ -39,7 +38,7 @@ class Args:
 
     env_id: str = "Pendulum-v1"
     """the id of the environment"""
-    total_timesteps: int = 10000000
+    total_timesteps: int = 1000000
     """total timesteps of the experiments"""
     learning_rate: float = 3e-4
     """the learning rate of the optimizer"""
