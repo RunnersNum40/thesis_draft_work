@@ -3,7 +3,7 @@ from jax import Array
 from jax import numpy as jnp
 from jax.typing import ArrayLike
 
-from utils import mlp_with_final_layer_std
+from utils import mlp_init
 
 
 class FakeNeuralActor:
@@ -21,12 +21,12 @@ class FakeNeuralActor:
         **kwargs,
     ) -> None:
         self.state_shape = (1,)
-        self.mlp = mlp_with_final_layer_std(
+        self.mlp = mlp_init(
             in_size=in_size,
             width_size=width_size,
             depth=depth,
             out_size=out_size,
-            std=0.01,
+            final_std=0.01,
             key=key,
             *args,
             **kwargs,

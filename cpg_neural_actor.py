@@ -8,7 +8,7 @@ from jax import random as jr
 from jax.typing import ArrayLike
 
 from neural_actor import AbstractNeuralActor, AbstractOutputMapping, AbstractVectorField
-from utils import mlp_with_final_layer_std
+from utils import mlp_init
 
 
 def split_states(states: ArrayLike, num_oscillators: int) -> tuple[Array, Array, Array]:
@@ -123,17 +123,20 @@ class ForcedCPG(AbstractVectorField, strict=True):
         key: Array,
     ) -> None:
         self.num_oscillators = num_oscillators
-        self.convergence_factor = convergence_factor
+        self.convergence_factor = convergence_factor  # this is trainable
         self.state_shape = 3 * num_oscillators
         self.param_shape = 2 * (num_oscillators + num_oscillators**2)
 
-        self.input_mapping = eqx.nn.MLP(
+        # Using a small std for the layers can make the early stages of training more stable
+        self.input_mapping = mlp_init(
             in_size=input_size + 1 + self.state_shape,
             out_size=self.param_shape,
             width_size=input_mapping_width,
             depth=input_mapping_depth,
             activation=jax.nn.softplus,  # Continuously differentiable activation function theoretically required
             final_activation=jax.nn.tanh,
+            hidden_std=0.01,
+            final_std=0.1,
             key=key,
         )
 
@@ -164,12 +167,12 @@ class CPGOutputMap(AbstractOutputMapping, strict=True):
         self.output_shape = (
             2 * num_oscillators
         )  # The naming might be misleading as the output shape is actually the input shape
-        self.output_mapping = mlp_with_final_layer_std(
+        self.output_mapping = mlp_init(
             in_size=self.output_shape,
             out_size=output_size,
             width_size=output_mapping_width,
             depth=output_mapping_depth,
-            std=0.01,
+            final_std=0.01,
             key=key,
         )
 

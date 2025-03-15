@@ -11,7 +11,7 @@ from jax import random as jr
 from torch.utils.tensorboard.writer import SummaryWriter
 
 from unbiased_neural_actor import UnbiasedNeuralActor
-from utils import mlp_with_final_layer_std
+from utils import mlp_init
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -43,21 +43,21 @@ class Agent(eqx.Module):
             output_mapping_depth=0,
             key=preprocessing_key,
         )
-        self.critic = mlp_with_final_layer_std(
+        self.critic = mlp_init(
             in_size=state_size,
             out_size="scalar",
             width_size=64,
             depth=3,
-            std=1.0,
+            final_std=1.0,
             activation=jax.nn.tanh,
             key=critic_key,
         )
-        self.actor_mean = mlp_with_final_layer_std(
+        self.actor_mean = mlp_init(
             in_size=state_size,
             out_size=int(jnp.asarray(env.action_space(env_params).shape).prod()),
             width_size=64,
             depth=3,
-            std=0.01,
+            final_std=0.01,
             activation=jax.nn.tanh,
             key=actor_mean_key,
         )
