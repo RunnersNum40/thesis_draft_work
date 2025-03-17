@@ -7,7 +7,6 @@ import gymnax as gym
 import jax
 import optax
 import optuna
-from gymnax import wrappers
 from jax import Array
 from jax import numpy as jnp
 from jax import random as jr
@@ -24,7 +23,7 @@ class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     seed: int = 1
     env_id: str = "Pendulum-v1"
-    total_timesteps: int = 100000
+    total_timesteps: int = 1000000
 
     learning_rate: float = 3e-4
     num_envs: int = 1
@@ -120,7 +119,9 @@ def test(args: Args) -> float:
         return (agent_dynamic, opt_state, training_state, key), None
 
     init_carry = (agent_dynamic, opt_state, training_states, key)
-    final_carry, _ = jax.lax.scan(train_step, init_carry, length=args.num_iterations)
+    final_carry, _ = jax.lax.scan(
+        train_step, init_carry, length=args.num_iterations // 10
+    )  # only 10% of the iterations
 
     agent_dynamic, opt_state, training_states, key = final_carry
     agent = eqx.combine(agent_dynamic, agent_static)
@@ -137,7 +138,7 @@ def test(args: Args) -> float:
 
 def objective(trial: optuna.Trial) -> float:
     learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-2, log=True)
-    num_steps = trial.suggest_int("num_steps", 128, 4096, log=True)
+    num_steps = trial.suggest_int("num_steps", 128, 4096)
     gamma = trial.suggest_float("gamma", 0.9, 0.999)
     gae_lambda = trial.suggest_float("gae_lambda", 0.9, 0.999)
     num_minibatches = trial.suggest_int("num_minibatches", 1, 64)
@@ -148,7 +149,7 @@ def objective(trial: optuna.Trial) -> float:
     ent_coef = trial.suggest_float("ent_coef", 0.0, 0.1)
     vf_coef = trial.suggest_float("vf_coef", 0.1, 0.9)
     max_grad_norm = trial.suggest_float("max_grad_norm", 0.1, 1.0)
-    actor_timestep = trial.suggest_float("actor_timestep", 0.01, 0.1)
+    actor_timestep = trial.suggest_float("actor_timestep", 1e-3, 1e-1, log=True)
 
     args = Args(
         learning_rate=learning_rate,
@@ -171,7 +172,7 @@ def objective(trial: optuna.Trial) -> float:
 
 if __name__ == "__main__":
     study = optuna.create_study(direction="maximize")
-    study.optimize(objective, n_trials=4)
+    study.optimize(objective, n_trials=300)
     study.trials_dataframe().to_csv(f"{os.path.basename(__file__)}-{Args.env_id}.csv")
 
     logger.info(f"Best value: {study.best_value}")
