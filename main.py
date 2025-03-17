@@ -2,6 +2,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
+from typing import Any, Callable
 
 import equinox as eqx
 import gymnax as gym
@@ -9,6 +10,8 @@ import jax
 import optax
 import tyro
 from gymnax import wrappers
+from gymnax.environments import environment, spaces
+from gymnax.wrappers.purerl import GymnaxWrapper
 from jax import Array
 from jax import numpy as jnp
 from jax import random as jr
@@ -40,37 +43,37 @@ class Args:
     """the id of the environment"""
     total_timesteps: int = 1000000
     """total timesteps of the experiments"""
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-4
     """the learning rate of the optimizer"""
     num_envs: int = 1
     """the number of parallel game environments"""
-    num_steps: int = 2048
+    num_steps: int = 846
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
-    gamma: float = 0.99
+    gamma: float = 0.93
     """the discount factor gamma"""
-    gae_lambda: float = 0.95
+    gae_lambda: float = 0.96
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 32
+    num_minibatches: int = 22
     """the number of mini-batches"""
-    update_epochs: int = 10
+    update_epochs: int = 16
     """the K epochs to update the policy"""
     norm_adv: bool = True
     """Toggles advantages normalization"""
-    clip_coef: float = 0.2
+    clip_coef: float = 0.29
     """the surrogate clipping coefficient"""
     clip_vloss: bool = True
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
-    ent_coef: float = 0.0
+    ent_coef: float = 0.04
     """coefficient of the entropy"""
-    vf_coef: float = 0.5
+    vf_coef: float = 0.8
     """coefficient of the value function"""
-    max_grad_norm: float = 0.5
+    max_grad_norm: float = 0.23
     """the maximum norm for the gradient clipping"""
     target_kl: float | None = None
     """the target KL divergence threshold"""
-    actor_timestep: float = 0.01
+    actor_timestep: float = 1e-3
     """the timestep for the agent internal ODE"""
 
     # to be filled in runtime
@@ -85,13 +88,42 @@ class Args:
         return hash(frozenset(vars(self).items()))
 
 
+class TransformObservationWrapper(GymnaxWrapper):
+    def __init__(
+        self,
+        env: environment.Environment | GymnaxWrapper,
+        func: Callable[[Any, Any, Array | None], Array],
+        observation_space: spaces.Box | None = None,
+    ):
+        super().__init__(env)
+        self.func = func
+        self._observation_space = observation_space
+
+    def observation_space(self, params) -> spaces.Box:
+        if self._observation_space is not None:
+            return self._observation_space
+        else:
+            return self._env.observation_space(params)
+
+    def reset(self, key: Array, params: environment.EnvParams) -> tuple[Array, Any]:
+        env_key, wrapper_key = jr.split(key)
+        obs, state = self._env.reset(env_key, params)
+        return self.func(obs, params, wrapper_key), state
+
+    def step(
+        self, key: Array, state: Any, action: Array, params: environment.EnvParams
+    ) -> tuple[Array, Any, Array, Array, dict[Any, Any]]:
+        env_key, wrapper_key = jr.split(key)
+        obs, reward, done, info, state = self._env.step(env_key, state, action, params)
+        return self.func(obs, params, wrapper_key), reward, done, info, state
+
+
 if __name__ == "__main__":
     args = tyro.cli(Args)
     args.batch_size = int(args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    print(f"Starting {run_name}")
 
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
@@ -104,6 +136,11 @@ if __name__ == "__main__":
 
     env, env_params = gym.make(args.env_id)
     env = wrappers.LogWrapper(env)
+    env = TransformObservationWrapper(
+        env,
+        lambda obs, params, key: obs[:2],
+        spaces.Box(-1.0, 1.0, (2,), jnp.float64),
+    )
 
     key, agent_key = jr.split(key)
     agent = Agent(env, env_params, key=agent_key)
@@ -122,6 +159,7 @@ if __name__ == "__main__":
 
     key, env_key = jr.split(key)
     next_observation, env_state = env.reset(env_key, env_params)
+    print(next_observation)
     key, state_key = jr.split(key)
 
     key, rollout_key = jr.split(key)

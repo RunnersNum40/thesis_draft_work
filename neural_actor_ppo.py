@@ -3,7 +3,7 @@ import logging
 import equinox as eqx
 import jax
 import optax
-from gymnax import wrappers
+from gymnax.wrappers.purerl import GymnaxWrapper
 from gymnax.environments import environment
 from jax import Array
 from jax import numpy as jnp
@@ -25,19 +25,19 @@ class Agent(eqx.Module):
 
     def __init__(
         self,
-        env: environment.Environment | wrappers.LogWrapper,
+        env: environment.Environment | GymnaxWrapper,
         env_params: environment.EnvParams,
         *,
         key: Array,
     ):
-        state_size = 4
+        state_size = 2
 
         preprocessing_key, critic_key, actor_mean_key = jr.split(key, 3)
         self.preprocessing = UnbiasedNeuralActor(
             state_shape=state_size,
             input_size=int(jnp.asarray(env.observation_space(env_params).shape).prod()),
             input_mapping_width=64,
-            input_mapping_depth=3,
+            input_mapping_depth=2,
             output_size=state_size,
             output_mapping_width=0,
             output_mapping_depth=0,
@@ -47,7 +47,7 @@ class Agent(eqx.Module):
             in_size=state_size,
             out_size="scalar",
             width_size=64,
-            depth=3,
+            depth=2,
             final_std=1.0,
             activation=jax.nn.tanh,
             key=critic_key,
@@ -56,7 +56,7 @@ class Agent(eqx.Module):
             in_size=state_size,
             out_size=int(jnp.asarray(env.action_space(env_params).shape).prod()),
             width_size=64,
-            depth=3,
+            depth=2,
             final_std=0.01,
             activation=jax.nn.tanh,
             key=actor_mean_key,
@@ -304,7 +304,7 @@ def train_on_rollout(
 
 
 def collect_rollout(
-    env: environment.Environment | wrappers.LogWrapper,
+    env: environment.Environment | GymnaxWrapper,
     env_params: environment.EnvParams,
     agent: Agent,
     training_states: dict[str, Array],
@@ -343,17 +343,16 @@ def collect_rollout(
         agent_state = agent.initial_state(agent_state_key)
         agent_time = jnp.array(0.0)
         # Fix the state typing
-        if isinstance(env, wrappers.LogWrapper):
-            env_state = eqx.tree_at(
-                lambda s: s.episode_returns,
-                env_state,
-                replace_fn=lambda x: x.astype(jnp.float64),
-            )
-            env_state = eqx.tree_at(
-                lambda s: s.returned_episode_returns,
-                env_state,
-                replace_fn=lambda x: x.astype(jnp.float64),
-            )
+        env_state = eqx.tree_at(
+            lambda s: s.episode_returns,
+            env_state,
+            replace_fn=lambda x: x.astype(jnp.float64),
+        )
+        env_state = eqx.tree_at(
+            lambda s: s.returned_episode_returns,
+            env_state,
+            replace_fn=lambda x: x.astype(jnp.float64),
+        )
         return next_obs, env_state, agent_state, agent_time
 
     def rollout_step(carry, _):
@@ -463,7 +462,7 @@ def write_stats(
 
 
 def evaluate(
-    env: environment.Environment | wrappers.LogWrapper,
+    env: environment.Environment | GymnaxWrapper,
     env_params: environment.EnvParams,
     agent: Agent,
     args,
