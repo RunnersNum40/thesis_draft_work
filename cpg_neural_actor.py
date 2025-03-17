@@ -176,7 +176,7 @@ class CPGOutputMap(AbstractOutputMapping, strict=True):
             key=key,
         )
 
-    def __call__(self, y: Array) -> Array:
+    def __call__(self, y: Array, x: Array) -> Array:
         return self.output_mapping(cpg_output(y, self.num_oscillators))
 
 

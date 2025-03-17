@@ -29,8 +29,8 @@ class AbstractOutputMapping(eqx.Module, strict=True):
     """Abstract module to map a system's state to an actor output."""
 
     @abstractmethod
-    def __call__(self, y: Array) -> Array:
-        """Map a state to an actor output."""
+    def __call__(self, y: Array, x: Array) -> Array:
+        """Map a state and observation to an actor output."""
         raise NotImplementedError
 
 
@@ -62,10 +62,10 @@ class AbstractNeuralActor(eqx.Module, Generic[VF, OM], strict=True):
         *,
         map_output: bool = True,
         max_steps: int = 4096,
-        adaptive_step_size: bool = False,
+        adaptive_step_size: bool = True,
     ) -> tuple[Array, Array | None]:
         term = diffrax.ODETerm(self.vector_field)  # pyright: ignore
-        solver = diffrax.Heun()
+        solver = diffrax.Tsit5()
         t0 = ts[0]
         t1 = ts[-1]
         dt0 = ts[1] - ts[0]
@@ -92,7 +92,7 @@ class AbstractNeuralActor(eqx.Module, Generic[VF, OM], strict=True):
         state = solution.ys[-1]
 
         if map_output:
-            return state, self.output_mapping(state)
+            return state, self.output_mapping(state, x)
 
         return state, None
 

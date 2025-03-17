@@ -44,6 +44,7 @@ class UnbiasedMap(AbstractOutputMapping):
     def __init__(
         self,
         state_shape: int,
+        observations_size: int,
         width_size: int,
         depth: int,
         out_size: int,
@@ -51,7 +52,7 @@ class UnbiasedMap(AbstractOutputMapping):
         key: Array,
     ) -> None:
         self.map = mlp_init(
-            in_size=state_shape,
+            in_size=state_shape + observations_size,
             width_size=width_size,
             depth=depth,
             out_size=out_size,
@@ -59,8 +60,8 @@ class UnbiasedMap(AbstractOutputMapping):
             key=key,
         )
 
-    def __call__(self, y: Array) -> Array:
-        return self.map(y)
+    def __call__(self, y: Array, x: Array) -> Array:
+        return self.map(jnp.concatenate([y, x]))
 
 
 class UnbiasedNeuralActor(AbstractNeuralActor[UnbiasedField, UnbiasedMap]):
@@ -91,6 +92,7 @@ class UnbiasedNeuralActor(AbstractNeuralActor[UnbiasedField, UnbiasedMap]):
 
         self.output_mapping = UnbiasedMap(
             state_shape,
+            input_size,
             output_mapping_width,
             output_mapping_depth,
             output_size,
