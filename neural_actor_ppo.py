@@ -13,6 +13,7 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from unbiased_neural_actor import UnbiasedNeuralActor
 from utils import mlp_init
 
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -37,9 +38,9 @@ class Agent(eqx.Module):
             state_shape=state_size,
             input_size=int(jnp.asarray(env.observation_space(env_params).shape).prod()),
             input_mapping_width=64,
-            input_mapping_depth=2,
+            input_mapping_depth=0,
             output_size=state_size,
-            output_mapping_width=0,
+            output_mapping_width=64,
             output_mapping_depth=0,
             key=preprocessing_key,
         )
@@ -49,7 +50,6 @@ class Agent(eqx.Module):
             width_size=64,
             depth=2,
             final_std=1.0,
-            activation=jax.nn.tanh,
             key=critic_key,
         )
         self.actor_mean = mlp_init(
@@ -58,7 +58,6 @@ class Agent(eqx.Module):
             width_size=64,
             depth=2,
             final_std=0.01,
-            activation=jax.nn.tanh,
             key=actor_mean_key,
         )
         self.actor_logstd = jnp.zeros(
@@ -66,15 +65,15 @@ class Agent(eqx.Module):
         )
 
     def get_value(self, x: Array, state: Array, ts: Array) -> Array:
-        state, x = self.preprocessing(ts, state, x, max_steps=2**14)
-        return self.critic(x)
+        state, hidden = self.preprocessing(ts, state, x)
+        return self.critic(hidden)
 
     def get_action_and_value(
         self, x: Array, state: Array, ts: Array, key: Array
     ) -> tuple[Array, Array, Array, Array, Array]:
-        state, x = self.preprocessing(ts, state, x, max_steps=2**14)
-        action_mean = self.actor_mean(x)
-        value = self.critic(x)
+        state, hidden = self.preprocessing(ts, state, x)
+        action_mean = self.actor_mean(hidden)
+        value = self.critic(hidden)
 
         action_std = jnp.exp(self.actor_logstd)
         action = jr.normal(key, action_mean.shape) * action_std + action_mean
@@ -92,9 +91,9 @@ class Agent(eqx.Module):
     def get_action_value(
         self, x: Array, state: Array, ts: Array, action: Array
     ) -> tuple[Array, Array, Array]:
-        state, x = self.preprocessing(ts, state, x, max_steps=2**14)
-        action_mean = self.actor_mean(x)
-        value = self.critic(x)
+        state, hidden = self.preprocessing(ts, state, x)
+        action_mean = self.actor_mean(hidden)
+        value = self.critic(hidden)
 
         action_std = jnp.exp(self.actor_logstd)
         logprob = jnp.sum(jax.scipy.stats.norm.logpdf(action, action_mean, action_std))
@@ -224,7 +223,7 @@ def train_on_rollout(
             ]
         ),
     )
-    _advantages, _returns = compute_gae(
+    advantages, returns = compute_gae(
         training_states["next_done"],
         next_value,
         rollouts["rewards"],
@@ -232,8 +231,8 @@ def train_on_rollout(
         rollouts["dones"],
         args,
     )
-    rollouts["advantages"] = _advantages
-    rollouts["returns"] = _returns
+    rollouts["advantages"] = advantages
+    rollouts["returns"] = returns
 
     rollouts = jax.tree.map(jax.lax.stop_gradient, rollouts)
 
@@ -252,18 +251,26 @@ def train_on_rollout(
 
             (_, stats), grads = loss_grad(
                 agent,
-                rollouts["observations"][batch_indices],
-                rollouts["states"][batch_indices],
-                rollouts["times"][batch_indices],
-                rollouts["actions"][batch_indices],
-                rollouts["advantages"][batch_indices],
-                rollouts["returns"][batch_indices],
-                rollouts["values"][batch_indices],
-                rollouts["log_probs"][batch_indices],
-                args,
+                observations=rollouts["observations"][batch_indices],
+                states=rollouts["states"][batch_indices],
+                times=rollouts["times"][batch_indices],
+                actions=rollouts["actions"][batch_indices],
+                advantages=rollouts["advantages"][batch_indices],
+                returns=rollouts["returns"][batch_indices],
+                values=rollouts["values"][batch_indices],
+                log_probs=rollouts["log_probs"][batch_indices],
+                args=args,
             )
 
             updates, opt_state = optimizer.update(grads, opt_state)
+
+            stats["grads"] = jnp.linalg.norm(
+                jnp.asarray(jax.tree.flatten(jax.tree.map(jnp.linalg.norm, grads))[0])
+            )
+            stats["updates"] = jnp.linalg.norm(
+                jnp.asarray(jax.tree.flatten(jax.tree.map(jnp.linalg.norm, updates))[0])
+            )
+
             agent = eqx.apply_updates(agent, updates)
             agent_dynamic, _ = eqx.partition(agent, eqx.is_array)
             return (agent_dynamic, opt_state), stats
@@ -281,6 +288,7 @@ def train_on_rollout(
         stats = jax.tree.map(lambda x: x.mean(), stats)
 
         carry = (key, agent_dynamic, opt_state)
+
         return carry, stats
 
     init_carry = (key, agent_dynamic, opt_state)
@@ -298,7 +306,7 @@ def train_on_rollout(
     )
     stats["explained_variance"] = explained_variance
 
-    stats["learning_rate"] = opt_state[1].hyperparams["learning_rate"]
+    stats["learning_rate"] = opt_state["adam"].hyperparams["learning_rate"]
 
     return agent, opt_state, stats
 
@@ -346,12 +354,12 @@ def collect_rollout(
         env_state = eqx.tree_at(
             lambda s: s.episode_returns,
             env_state,
-            replace_fn=lambda x: x.astype(jnp.float64),
+            replace_fn=lambda x: jnp.astype(x, jnp.float64),
         )
         env_state = eqx.tree_at(
             lambda s: s.returned_episode_returns,
             env_state,
-            replace_fn=lambda x: x.astype(jnp.float64),
+            replace_fn=lambda x: jnp.astype(x, jnp.float64),
         )
         return next_obs, env_state, agent_state, agent_time
 
@@ -373,13 +381,12 @@ def collect_rollout(
         agent_state, action, log_prob, _, value = agent.get_action_and_value(
             next_observation, agent_state, ts, action_key
         )
-        action = jnp.clip(
+        clipped_action = jnp.clip(
             action, env.action_space(env_params).low, env.action_space(env_params).high
         )
-
         key, env_step_key = jr.split(key)
         next_observation, env_state, reward, next_done, info = env.step(
-            env_step_key, env_state, action, env_params
+            env_step_key, env_state, clipped_action, env_params
         )
 
         key, _ = jr.split(key)
@@ -468,10 +475,12 @@ def evaluate(
     args,
     key: Array,
     max_steps: int = 1000,
-) -> Array:
+) -> tuple[Array, Array]:
     key, env_state_key, agent_state_key, key = jr.split(key, 4)
     next_obs, env_state = env.reset(env_state_key, env_params)
     agent_state = agent.initial_state(agent_state_key)
+
+    state_storage = jnp.zeros((max_steps, *agent_state.shape))
 
     state = {
         "key": key,
@@ -482,6 +491,7 @@ def evaluate(
         "total_reward": jnp.array(0.0),
         "done": jnp.array(False),
         "steps": jnp.array(0),
+        "state_storage": state_storage,
     }
 
     def not_complete(state: dict[str, Array]):
@@ -504,6 +514,10 @@ def evaluate(
         next_obs, new_env_state, reward, done, _ = env.step(
             step_key, state["env_state"], action, env_params
         )
+
+        steps = state["steps"]
+        state_storage = state["state_storage"].at[steps].set(new_agent_state)
+
         return {
             "key": new_key,
             "env_state": new_env_state,
@@ -512,8 +526,11 @@ def evaluate(
             "next_obs": next_obs,
             "total_reward": state["total_reward"] + reward,
             "done": done,
-            "steps": state["steps"] + 1,
+            "steps": steps + 1,
+            "state_storage": state_storage,
         }
 
     final_state = jax.lax.while_loop(not_complete, env_step, state)
-    return final_state["total_reward"]
+    recorded_states = final_state["state_storage"][: final_state["steps"]]
+
+    return final_state["total_reward"], recorded_states

@@ -29,8 +29,6 @@ class UnbiasedField(AbstractVectorField):
             depth=depth,
             activation=jax.nn.softplus,  # Continuously differentiable activation function theoretically required
             final_activation=jax.nn.tanh,
-            hidden_std=0.01,
-            final_std=0.1,
             key=key,
         )
 
@@ -56,7 +54,6 @@ class UnbiasedMap(AbstractOutputMapping):
             width_size=width_size,
             depth=depth,
             out_size=out_size,
-            final_std=0.01,
             key=key,
         )
 

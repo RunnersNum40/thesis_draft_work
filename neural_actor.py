@@ -70,7 +70,7 @@ class AbstractNeuralActor(eqx.Module, Generic[VF, OM], strict=True):
         t1 = ts[-1]
         dt0 = ts[1] - ts[0]
         saveat = diffrax.SaveAt(t1=True)
-        if adaptive_step_size:
+        if adaptive_step_size and isinstance(solver, diffrax.AbstractAdaptiveSolver):
             stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-6)
         else:
             stepsize_controller = diffrax.ConstantStepSize()

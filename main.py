@@ -41,13 +41,13 @@ class Args:
 
     env_id: str = "Pendulum-v1"
     """the id of the environment"""
-    total_timesteps: int = 1000000
+    total_timesteps: int = 1048576
     """total timesteps of the experiments"""
     learning_rate: float = 1e-4
     """the learning rate of the optimizer"""
     num_envs: int = 1
     """the number of parallel game environments"""
-    num_steps: int = 846
+    num_steps: int = 1024
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -55,7 +55,7 @@ class Args:
     """the discount factor gamma"""
     gae_lambda: float = 0.96
     """the lambda for the general advantage estimation"""
-    num_minibatches: int = 22
+    num_minibatches: int = 32
     """the number of mini-batches"""
     update_epochs: int = 16
     """the K epochs to update the policy"""
@@ -63,17 +63,17 @@ class Args:
     """Toggles advantages normalization"""
     clip_coef: float = 0.29
     """the surrogate clipping coefficient"""
-    clip_vloss: bool = True
+    clip_vloss: bool = False
     """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
     ent_coef: float = 0.04
     """coefficient of the entropy"""
     vf_coef: float = 0.8
     """coefficient of the value function"""
-    max_grad_norm: float = 0.23
+    max_grad_norm: float = 0.5
     """the maximum norm for the gradient clipping"""
     target_kl: float | None = None
     """the target KL divergence threshold"""
-    actor_timestep: float = 1e-3
+    actor_timestep: float = 1e-2
     """the timestep for the agent internal ODE"""
 
     # to be filled in runtime
@@ -114,8 +114,26 @@ class TransformObservationWrapper(GymnaxWrapper):
         self, key: Array, state: Any, action: Array, params: environment.EnvParams
     ) -> tuple[Array, Any, Array, Array, dict[Any, Any]]:
         env_key, wrapper_key = jr.split(key)
-        obs, reward, done, info, state = self._env.step(env_key, state, action, params)
-        return self.func(obs, params, wrapper_key), reward, done, info, state
+        obs, state, reward, done, info = self._env.step(env_key, state, action, params)
+        return self.func(obs, params, wrapper_key), state, reward, done, info
+
+
+class TransformRewardWrapper(GymnaxWrapper):
+    def __init__(
+        self,
+        env: environment.Environment | GymnaxWrapper,
+        func: Callable[[Any, Any, Array | None], Array],
+    ):
+        super().__init__(env)
+        self.func = func
+
+    def step(
+        self, key: Array, state: Any, action: Array, params: environment.EnvParams
+    ) -> tuple[Array, Any, Array, Array, dict[Any, Any]]:
+        env_key, wrapper_key = jr.split(key)
+        obs, state, reward, done, info = self._env.step(env_key, state, action, params)
+        reward = self.func(reward, params, wrapper_key)
+        return obs, state, reward, done, info
 
 
 if __name__ == "__main__":
@@ -125,21 +143,17 @@ if __name__ == "__main__":
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 
-    writer = SummaryWriter(f"runs/{run_name}")
-    writer.add_text(
-        "hyperparameters",
-        "|param|value|\n|-|-|\n%s"
-        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
-    )
-
     key = jr.key(args.seed)
 
     env, env_params = gym.make(args.env_id)
     env = wrappers.LogWrapper(env)
     env = TransformObservationWrapper(
         env,
-        lambda obs, params, key: obs[:2],
-        spaces.Box(-1.0, 1.0, (2,), jnp.float64),
+        lambda obs, params, key: jnp.clip(obs[:2], -10.0, 10.0),
+        spaces.Box(-10.0, 10.0, (2,), jnp.float64),
+    )
+    env = TransformRewardWrapper(
+        env, lambda reward, params, key: jnp.clip(reward, -10.0, 10.0)
     )
 
     key, agent_key = jr.split(key)
@@ -153,13 +167,15 @@ if __name__ == "__main__":
         )
     else:
         schedule = optax.constant_schedule(args.learning_rate)
-    adam = optax.inject_hyperparams(optax.adam)(learning_rate=schedule)
-    optimizer = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), adam)
+    adam = optax.inject_hyperparams(optax.adam)(learning_rate=schedule, eps=1e-5)
+    optimizer = optax.named_chain(
+        ("clipping", optax.clip_by_global_norm(args.max_grad_norm)), ("adam", adam)
+    )
+    # optimizer = optax.named_chain(("adam", adam))
     opt_state = optimizer.init(eqx.filter(agent, eqx.is_inexact_array))
 
     key, env_key = jr.split(key)
     next_observation, env_state = env.reset(env_key, env_params)
-    print(next_observation)
     key, state_key = jr.split(key)
 
     key, rollout_key = jr.split(key)
@@ -172,6 +188,13 @@ if __name__ == "__main__":
         "next_done": jnp.array(False),
         "global_step": jnp.array(0),
     }
+
+    writer = SummaryWriter(f"runs/{run_name}")
+    writer.add_text(
+        "hyperparameters",
+        "|param|value|\n|-|-|\n%s"
+        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+    )
 
     @eqx.filter_jit
     def train_step(
@@ -214,9 +237,18 @@ if __name__ == "__main__":
     writer.close()
 
     key, eval_key = jr.split(key)
-    score = jnp.mean(
-        jax.vmap(evaluate, in_axes=(None, None, None, None, 0))(
-            env, env_params, agent, args, jr.split(eval_key, 10)
-        )
+    scores, states = jax.vmap(evaluate, in_axes=(None, None, None, None, 0))(
+        env, env_params, agent, args, jr.split(eval_key, 10)
     )
-    logger.info(f"Score: {score}")
+    logger.info(f"Score: {scores.mean()}")
+
+    from matplotlib import pyplot as plt
+    import numpy as np
+
+    states = np.array(states[0])
+    times = np.arange(states.shape[0]) * args.actor_timestep
+
+    plt.plot(times, states)
+    plt.xlabel("Time")
+    plt.ylabel("State")
+    plt.show()
