@@ -5,6 +5,7 @@ import diffrax
 import equinox as eqx
 import jax
 from jax import Array
+from jax import numpy as jnp
 from jax.typing import ArrayLike
 
 jax.config.update("jax_enable_x64", True)
@@ -29,7 +30,7 @@ class AbstractOutputMapping(eqx.Module, strict=True):
     """Abstract module to map a system's state to an actor output."""
 
     @abstractmethod
-    def __call__(self, y: Array, x: Array) -> Array:
+    def __call__(self, y: Array, x: Array, *, key: Array | None = None) -> Array:
         """Map a state and observation to an actor output."""
         raise NotImplementedError
 
@@ -44,6 +45,7 @@ class AbstractNeuralActor(eqx.Module, Generic[VF, OM], strict=True):
     output_mapping: eqx.AbstractVar[OM]
 
     def __check_init__(self):
+        """Assert subclass attributes are of the correct type."""
         if not isinstance(self.vector_field, AbstractVectorField):
             raise TypeError(
                 f"Expected vector_field to be a subclass of AbstractVectorField, got {self.vector_field} instead"
@@ -60,9 +62,9 @@ class AbstractNeuralActor(eqx.Module, Generic[VF, OM], strict=True):
         y0: Array,
         x: ArrayLike,
         *,
-        map_output: bool = True,
         max_steps: int = 4096,
         adaptive_step_size: bool = True,
+        key: Array | None = None,
     ) -> tuple[Array, Array | None]:
         term = diffrax.ODETerm(self.vector_field)  # pyright: ignore
         solver = diffrax.Tsit5()
@@ -91,16 +93,13 @@ class AbstractNeuralActor(eqx.Module, Generic[VF, OM], strict=True):
         assert solution.ys is not None
         state = solution.ys[-1]
 
-        if map_output:
-            return state, self.output_mapping(state, x)
-
-        return state, None
+        return state, self.output_mapping(state, jnp.asarray(x))
 
     @property
     def state_shape(self) -> tuple[int]:
         return (self.vector_field.state_shape,)
 
     @abstractmethod
-    def initial_state(self, key: Array | None) -> Array:
+    def initial_state(self, x: Array | None = None, *, key: Array | None) -> Array:
         """Generate an initial state for the model."""
         raise NotImplementedError

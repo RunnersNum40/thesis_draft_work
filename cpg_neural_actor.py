@@ -176,7 +176,7 @@ class CPGOutputMap(AbstractOutputMapping, strict=True):
             key=key,
         )
 
-    def __call__(self, y: Array, x: Array) -> Array:
+    def __call__(self, y: Array, x: Array, *, key: Array | None = None) -> Array:
         return self.output_mapping(cpg_output(y, self.num_oscillators))
 
 
@@ -187,6 +187,7 @@ class CPGNeuralActor(AbstractNeuralActor[ForcedCPG, CPGOutputMap], strict=True):
     convergence_factor: float
     vector_field: ForcedCPG
     output_mapping: CPGOutputMap
+    initial_state_mapping: eqx.nn.MLP
 
     def __init__(
         self,
@@ -201,7 +202,7 @@ class CPGNeuralActor(AbstractNeuralActor[ForcedCPG, CPGOutputMap], strict=True):
         *,
         key: Array,
     ) -> None:
-        input_key, output_key = jr.split(key)
+        input_key, output_key, initial_state_key = jr.split(key, 3)
 
         self.num_oscillators = num_oscillators
         self.convergence_factor = convergence_factor
@@ -223,6 +224,14 @@ class CPGNeuralActor(AbstractNeuralActor[ForcedCPG, CPGOutputMap], strict=True):
             key=output_key,
         )
 
+        self.initial_state_mapping = mlp_init(
+            in_size=input_size,
+            out_size=self.vector_field.state_shape,
+            width_size=input_mapping_width,
+            depth=input_mapping_depth,
+            key=initial_state_key,
+        )
+
     @property
     def param_shape(self) -> tuple[int]:
         return (self.vector_field.param_shape,)
@@ -231,5 +240,6 @@ class CPGNeuralActor(AbstractNeuralActor[ForcedCPG, CPGOutputMap], strict=True):
     def output_shape(self) -> tuple[int]:
         return (self.output_mapping.output_shape,)
 
-    def initial_state(self, key: Array | None) -> Array:
-        return jnp.zeros(self.vector_field.state_shape)
+    def initial_state(self, x: Array | None = None, *, key: Array | None) -> Array:
+        assert x is not None, "Initial state requires an input"
+        return self.initial_state_mapping(x)

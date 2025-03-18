@@ -57,13 +57,14 @@ class UnbiasedMap(AbstractOutputMapping):
             key=key,
         )
 
-    def __call__(self, y: Array, x: Array) -> Array:
+    def __call__(self, y: Array, x: Array, *, key: Array | None = None) -> Array:
         return self.map(jnp.concatenate([y, x]))
 
 
 class UnbiasedNeuralActor(AbstractNeuralActor[UnbiasedField, UnbiasedMap]):
     vector_field: UnbiasedField
     output_mapping: UnbiasedMap
+    initial_state_mapping: eqx.nn.MLP
 
     def __init__(
         self,
@@ -77,7 +78,7 @@ class UnbiasedNeuralActor(AbstractNeuralActor[UnbiasedField, UnbiasedMap]):
         *,
         key: Array,
     ) -> None:
-        input_key, output_key = jax.random.split(key)
+        input_key, output_key, initial_state_key = jax.random.split(key, 3)
 
         self.vector_field = UnbiasedField(
             state_shape,
@@ -96,5 +97,14 @@ class UnbiasedNeuralActor(AbstractNeuralActor[UnbiasedField, UnbiasedMap]):
             key=output_key,
         )
 
-    def initial_state(self, key: Array | None) -> Array:
-        return jnp.zeros(self.vector_field.state_shape)
+        self.initial_state_mapping = eqx.nn.MLP(
+            in_size=input_size,
+            out_size=state_shape,
+            width_size=input_mapping_width,
+            depth=input_mapping_depth,
+            key=initial_state_key,
+        )
+
+    def initial_state(self, x: Array | None = None, *, key: Array | None) -> Array:
+        assert x is not None, "Initial state requires an input"
+        return self.initial_state_mapping(x)

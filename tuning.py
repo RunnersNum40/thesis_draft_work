@@ -11,7 +11,7 @@ from jax import Array
 from jax import numpy as jnp
 from jax import random as jr
 
-from neural_actor_ppo import Agent, collect_rollout, evaluate, train_on_rollout
+from main import Agent, collect_rollout, evaluate, train_on_rollout
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -82,7 +82,7 @@ def test(args: Args) -> float:
     training_states = {
         "key": rollout_key,
         "env_state": env_state,
-        "agent_state": agent.initial_state(state_key),
+        "agent_state": agent.initial_state(next_observation, key=state_key),
         "agent_time": jnp.array(0.0),
         "next_observation": next_observation,
         "next_done": jnp.array(False),
@@ -127,13 +127,11 @@ def test(args: Args) -> float:
     agent = eqx.combine(agent_dynamic, agent_static)
 
     key, eval_key = jr.split(key)
-    score = jnp.mean(
-        jax.vmap(evaluate, in_axes=(None, None, None, None, 0))(
-            env, env_params, agent, args, jr.split(eval_key, 10)
-        )
+    scores, _ = jax.vmap(evaluate, in_axes=(None, None, None, None, 0))(
+        env, env_params, agent, args, jr.split(eval_key, 10)
     )
 
-    return float(score)
+    return float(scores.mean())
 
 
 def objective(trial: optuna.Trial) -> float:
