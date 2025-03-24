@@ -351,9 +351,8 @@ def collect_rollout(
 
 
 def get_batch_indices(batch_size: int, data_size: int, key: Array) -> jnp.ndarray:
-    perm = jr.permutation(key, data_size, independent=True)
-    num_batches = data_size // batch_size
-    return perm[: num_batches * batch_size].reshape(num_batches, batch_size)
+    perm = jr.permutation(key, data_size)
+    return perm.reshape(-1, batch_size)
 
 
 def compute_gae(
@@ -600,7 +599,7 @@ def evaluate(
         "env_state": env_state,
         "agent_state": agent_state,
         "agent_time": jnp.array(0.0),
-        "next_obs": next_observation,
+        "next_observation": next_observation,
         "total_reward": jnp.array(0.0),
         "done": jnp.array(False),
         "steps": jnp.array(0),
@@ -617,14 +616,14 @@ def evaluate(
         new_key, action_key, step_key = keys[0], keys[1], keys[2]
         ts = jnp.array([state["agent_time"], state["agent_time"] + args.actor_timestep])
         new_agent_state, action, _, _, _ = agent.get_action_and_value(
-            state["next_obs"], state["agent_state"], ts, action_key
+            state["next_observation"], state["agent_state"], ts, action_key
         )
         action = jnp.clip(
             action,
             env.action_space(env_params).low,
             env.action_space(env_params).high,
         )
-        next_obs, new_env_state, reward, done, _ = env.step(
+        next_observation, new_env_state, reward, done, _ = env.step(
             step_key, state["env_state"], action, env_params
         )
 
@@ -636,7 +635,7 @@ def evaluate(
             "env_state": new_env_state,
             "agent_state": new_agent_state,
             "agent_time": ts[1],
-            "next_obs": next_obs,
+            "next_observation": next_observation,
             "total_reward": state["total_reward"] + reward,
             "done": done,
             "steps": steps + 1,
