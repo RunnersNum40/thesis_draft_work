@@ -17,93 +17,7 @@ from neural_cde import NeuralCDE
 logger = logging.getLogger(__name__)
 
 
-class AbstractActorCriticAgent(eqx.Module, strict=True):
-    """Abstract class for an actor-critic agent.
-
-    Defines the basic interface for an actor-critic agent.
-    """
-
-    input_size: eqx.AbstractVar[int]
-    action_size: eqx.AbstractVar[int]
-
-
-class AbstractStatefulActorCriticAgent(AbstractActorCriticAgent, strict=True):
-    state_size: eqx.AbstractVar[int]
-
-    @abstractmethod
-    def get_value(
-        self,
-        ts: Float[ArrayLike, " N"],
-        xs: Float[ArrayLike, " N {self.input_size}"],
-        z0: Float[Array, " {self.state_size}"],
-        *args,
-        key: Key | None = None,
-        **kwargs,
-    ) -> Float[Array, ""]:
-        """Return the value of the given inputs."""
-        raise NotImplementedError
-
-    @abstractmethod
-    def get_action_and_value(
-        self,
-        ts: Float[ArrayLike, " N"],
-        xs: Float[ArrayLike, " N {self.input_size}"],
-        z0: Float[Array, " {self.state_size}"],
-        a1: Float[ArrayLike, " {self.action_size}"] | None = None,
-        *args,
-        key: Key | None = None,
-        **kwargs,
-    ) -> tuple[
-        Float[Array, " {self.state_size}"],
-        Float[Array, " {self.action_size}"],
-        Float[Array, ""],
-        Float[Array, ""],
-        Float[Array, ""],
-    ]:
-        """Return a final action and value for the given inputs.
-
-        If an action is provided, it assumed to be fixed and the
-        value is computed for the given action. Otherwise, the action is
-        computed from the given inputs and sampled from the action distribution
-        of the actor-critic model over the inputs.
-
-        Arguments:
-        - ts: Time steps of the inputs.
-        - xs: Inputs to the actor-critic model.
-        - z0: Initial state of the actor-critic model.
-        - a1: Optional fixed action.
-        - Key: Key for sampling the action.
-
-        Returns:
-        - z1: Final state of the actor-critic model.
-        - a1: Action computed from the inputs.
-        - log prob: Log probability of the action.
-        - entropy: Entropy of the action distribution.
-        - value: Value of the final state.
-        """
-        raise NotImplementedError
-
-    @abstractmethod
-    def initial_state(
-        self,
-        t0: Float,
-        x0: Float[ArrayLike, " {self.input_size}"],
-        *,
-        key: Key | None = None,
-    ) -> Float[Array, " {self.state_size}"]:
-        """Generate an initial state z_0 from an inital input x_0.
-
-        Arguments:
-        - x0: Initial input to the actor-critic model.
-        - key: Optional random key.
-
-        Returns:
-        - z0: Initial state of the actor-critic model.
-        """
-        raise NotImplementedError
-
-
-class CDEAgent(AbstractStatefulActorCriticAgent, strict=True):
+class CDEAgent(eqx.Module):
     input_size: int
     state_size: int
     action_size: int
@@ -303,10 +217,6 @@ class RolloutBuffer:
     truncations: Bool[Array, " *N"]
     advantages: Float[Array, " *N"]
     returns: Float[Array, " *N"]
-
-
-@chex.dataclass
-class StatefulRolloutBuffer(RolloutBuffer):
     times: Float[Array, " *N"]
     states: Float[Array, " *N state_size"]
 
@@ -319,10 +229,6 @@ class TrainingState:
     opt_state: optax.OptState
     observation: Float[Array, " observation_size"]
     global_step: Int[Array, ""]
-
-
-@chex.dataclass
-class StatefulAgentTrainingState(TrainingState):
     last_observation: Float[Array, " observation_size"]
     agent_time: Float[Array, ""]
     last_agent_time: Float[Array, ""]
@@ -370,11 +276,11 @@ def make_empty(cls, **kwargs):
 def reset(
     env: environment.Environment,
     env_params: gym.EnvParams,
-    agent: AbstractStatefulActorCriticAgent,
-    training_state: StatefulAgentTrainingState,
+    agent: CDEAgent,
+    training_state: TrainingState,
     *,
     key: Key,
-) -> StatefulAgentTrainingState:
+) -> TrainingState:
     """Reset the environment and agent to a fresh state.
 
     Arguments:
@@ -393,7 +299,7 @@ def reset(
     agent_time = jnp.array(0.0)
     agent_state = agent.initial_state(agent_time, observation, key=agent_key)
 
-    return StatefulAgentTrainingState(
+    return TrainingState(
         env_state=env_state,
         opt_state=training_state.opt_state,
         observation=observation,
@@ -408,11 +314,11 @@ def reset(
 def env_step(
     env: environment.Environment,
     env_params: gym.EnvParams,
-    agent: AbstractStatefulActorCriticAgent,
-    training_state: StatefulAgentTrainingState,
+    agent: CDEAgent,
+    training_state: TrainingState,
     *,
     key: Key,
-) -> tuple[StatefulAgentTrainingState, StatefulRolloutBuffer]:
+) -> tuple[TrainingState, RolloutBuffer]:
     """Step the environment and agent forward one step and store the data in a rollout buffer.
 
     Arguments:
@@ -428,7 +334,7 @@ def env_step(
     actor_key, env_key, reset_key = jr.split(key, 3)
 
     # Store the current state
-    buffer = make_empty(StatefulRolloutBuffer)
+    buffer = make_empty(RolloutBuffer)
     buffer.observations = training_state.observation
     buffer.times = training_state.agent_time
     buffer.states = training_state.agent_state
@@ -482,15 +388,15 @@ def env_step(
 def collect_stateful_ppo_rollout(
     env: environment.Environment,
     env_params: gym.EnvParams,
-    agent: AbstractStatefulActorCriticAgent,
-    training_state: StatefulAgentTrainingState,
+    agent: CDEAgent,
+    training_state: TrainingState,
     args: PPOArguments,
     *,
     key: Key,
-) -> tuple[StatefulAgentTrainingState, StatefulRolloutBuffer]:
+) -> tuple[TrainingState, RolloutBuffer]:
     def scan_env_step(
-        carry: tuple[StatefulAgentTrainingState, Key], _
-    ) -> tuple[tuple[StatefulAgentTrainingState, Key], StatefulRolloutBuffer]:
+        carry: tuple[TrainingState, Key], _
+    ) -> tuple[tuple[TrainingState, Key], RolloutBuffer]:
         training_state, key = carry
         carry_key, step_key = jr.split(key, 2)
 
@@ -510,11 +416,11 @@ def collect_stateful_ppo_rollout(
 
 
 def compute_gae(
-    agent: AbstractStatefulActorCriticAgent,
-    rollout: StatefulRolloutBuffer,
-    training_state: StatefulAgentTrainingState,
+    agent: CDEAgent,
+    rollout: RolloutBuffer,
+    training_state: TrainingState,
     args: PPOArguments,
-) -> StatefulRolloutBuffer:
+) -> RolloutBuffer:
     next_value = agent.get_value(
         ts=jnp.asarray([training_state.last_agent_time, training_state.agent_time]),
         xs=jnp.asarray([training_state.last_observation, training_state.observation]),
@@ -566,9 +472,9 @@ def compute_gae(
 
 
 def loss(
-    agent: AbstractStatefulActorCriticAgent,
-    training_state: StatefulAgentTrainingState,
-    rollout: StatefulRolloutBuffer,
+    agent: CDEAgent,
+    training_state: TrainingState,
+    rollout: RolloutBuffer,
     args: PPOArguments,
 ) -> tuple[Float[Array, ""], PPOStats]:
     times_full = jnp.concatenate(
@@ -658,14 +564,14 @@ def get_batch_indices(
 
 
 def train_on_batch(
-    agent: AbstractStatefulActorCriticAgent,
-    training_state: StatefulAgentTrainingState,
+    agent: CDEAgent,
+    training_state: TrainingState,
     optimizer: optax.GradientTransformation,
     opt_state: optax.OptState,
-    rollout: StatefulRolloutBuffer,
+    rollout: RolloutBuffer,
     batch_indices: Int[Array, " N"],
     args: PPOArguments,
-) -> tuple[AbstractStatefulActorCriticAgent, optax.OptState, PPOStats]:
+) -> tuple[CDEAgent, optax.OptState, PPOStats]:
     rollout = jax.tree.map(lambda x: x[batch_indices], rollout)
     (_, stats), grads = loss_grad(agent, training_state, rollout, args)
     updates, opt_state = optimizer.update(grads, opt_state)
@@ -675,15 +581,15 @@ def train_on_batch(
 
 
 def epoch(
-    agent: AbstractStatefulActorCriticAgent,
-    training_state: StatefulAgentTrainingState,
+    agent: CDEAgent,
+    training_state: TrainingState,
     optimizer: optax.GradientTransformation,
     opt_state: optax.OptState,
-    rollout: StatefulRolloutBuffer,
+    rollout: RolloutBuffer,
     args: PPOArguments,
     *,
     key: Key | None = None,
-) -> tuple[AbstractStatefulActorCriticAgent, optax.OptState, PPOStats]:
+) -> tuple[CDEAgent, optax.OptState, PPOStats]:
     agent_dynamic, agent_static = eqx.partition(agent, eqx.is_array)
 
     def scan_batch(
@@ -711,15 +617,15 @@ def epoch(
 
 
 def train_on_rollout(
-    agent: AbstractStatefulActorCriticAgent,
-    training_state: StatefulAgentTrainingState,
+    agent: CDEAgent,
+    training_state: TrainingState,
     optimizer: optax.GradientTransformation,
     opt_state: optax.OptState,
-    rollout: StatefulRolloutBuffer,
+    rollout: RolloutBuffer,
     args: PPOArguments,
     *,
     key: Key | None = None,
-) -> tuple[AbstractStatefulActorCriticAgent, optax.OptState, PPOStats]:
+) -> tuple[CDEAgent, optax.OptState, PPOStats]:
     agent_dynamic, agent_static = eqx.partition(agent, eqx.is_array)
 
     def scan_epoch(
@@ -756,16 +662,16 @@ def train(
     env: environment.Environment,
     env_params: gym.EnvParams,
     optimizer: optax.GradientTransformation,
-    agent: AbstractStatefulActorCriticAgent,
+    agent: CDEAgent,
     args: PPOArguments,
     *,
     key=Key,
-) -> AbstractStatefulActorCriticAgent:
+) -> CDEAgent:
     agent_dynamic, agent_static = eqx.partition(agent, eqx.is_array)
 
     def scan_step(
-        carry: tuple[StatefulAgentTrainingState, PyTree, optax.OptState, Key], xs: None
-    ) -> tuple[tuple[StatefulAgentTrainingState, PyTree, optax.OptState, Key], PyTree]:
+        carry: tuple[TrainingState, PyTree, optax.OptState, Key], xs: None
+    ) -> tuple[tuple[TrainingState, PyTree, optax.OptState, Key], PyTree]:
         training_state, agent_dynamic, opt_state, key = carry
         agent = eqx.combine(agent_dynamic, agent_static)
         rollout_key, training_key = jr.split(key, 2)
@@ -787,7 +693,7 @@ def train(
     opt_state = optimizer.init(eqx.filter(agent, eqx.is_inexact_array))
     reset_key, training_key = jr.split(key, 2)
     training_state = make_empty(
-        StatefulAgentTrainingState, global_step=jnp.array(0), opt_state=opt_state
+        TrainingState, global_step=jnp.array(0), opt_state=opt_state
     )
     training_state = reset(env, env_params, agent, training_state, key=reset_key)
 
