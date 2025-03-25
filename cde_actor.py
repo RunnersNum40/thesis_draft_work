@@ -1,11 +1,12 @@
 import dataclasses
 import logging
-from abc import abstractmethod
+from functools import partial
 
 import chex
 import equinox as eqx
 import gymnax as gym
 import jax
+from numpy import roll
 import optax
 from gymnax.environments import environment
 from jax import numpy as jnp
@@ -113,22 +114,31 @@ class CDEAgent(eqx.Module):
         z0: Float[Array, " {self.state_size}"],
         *,
         key: Key | None = None,
-    ) -> Float[Array, ""]:
+        evolving_out: bool = False,
+    ) -> Float[Array, " *N"]:
         """Return the value of the given inputs.
+
+        A set of times and inputs padded with NaNs is provided to allow for
+        JIT compilation since the number of steps is not known at compile time.
+        Pass the maximum index of the inputs to act on as `max_index`.
 
         Arguments:
         - ts: Time steps of the inputs.
         - xs: Inputs to the actor-critic model.
         - z0: Initial state of the actor-critic model.
         - key: Key for sampling the action.
+        - evolving_out: Whether to compute the output for every time step.
 
         Returns:
         - value: Value of the final state.
         """
-        _, processed = self.neural_cde(jnp.asarray(ts), jnp.asarray(xs), z0)
-        value = self.critic(processed)
-
-        return value
+        _, processed = self.neural_cde(
+            jnp.asarray(ts), jnp.asarray(xs), z0, evolving_out=evolving_out
+        )
+        if evolving_out:
+            return jax.vmap(self.critic)(processed)
+        else:
+            return self.critic(processed)
 
     def get_action_and_value(
         self,
@@ -138,12 +148,13 @@ class CDEAgent(eqx.Module):
         a1: Float[ArrayLike, " {self.action_size}"] | None = None,
         *,
         key: Key | None = None,
+        evolving_out: bool = False,
     ) -> tuple[
-        Float[Array, " {self.state_size}"],
-        Float[Array, " {self.action_size}"],
-        Float[Array, ""],
-        Float[Array, ""],
-        Float[Array, ""],
+        Float[Array, " *N {self.state_size}"],
+        Float[Array, " *N {self.action_size}"],
+        Float[Array, " *N"],
+        Float[Array, " *N"],
+        Float[Array, " *N"],
     ]:
         """Return a final action and value for the given inputs.
 
@@ -152,12 +163,17 @@ class CDEAgent(eqx.Module):
         computed from the given inputs and sampled from the action distribution
         of the actor-critic model over the inputs.
 
+        A set of times and inputs padded with NaNs is provided to allow for
+        JIT compilation since the number of steps is not known at compile time.
+        Pass the maximum index of the inputs to act on as `max_index`.
+
         Arguments:
         - ts: Time steps of the inputs.
         - xs: Inputs to the actor-critic model.
         - z0: Initial state of the actor-critic model.
         - a1: Optional fixed action.
         - key: Key for sampling the action.
+        - evolving_out: Whether to compute the output for every time step.
 
         Returns:
         - z1: Final state of the actor-critic model.
@@ -166,10 +182,17 @@ class CDEAgent(eqx.Module):
         - entropy: Entropy of the action distribution.
         - value: Value of the final state.
         """
-        z1, processed = self.neural_cde(jnp.asarray(ts), jnp.asarray(xs), z0)
-        action_mean = self.actor(processed)
+        z1, processed = self.neural_cde(
+            jnp.asarray(ts), jnp.asarray(xs), z0, evolving_out=evolving_out
+        )
+        if evolving_out:
+            action_mean = jax.vmap(self.actor)(processed)
+            value = jax.vmap(self.critic)(processed)
+        else:
+            action_mean = self.actor(processed)
+            value = self.critic(processed)
+
         action_std = jnp.exp(self.action_std)
-        value = self.critic(processed)
 
         if a1 is None:
             if key is not None:
@@ -179,8 +202,15 @@ class CDEAgent(eqx.Module):
         else:
             a1 = jnp.asarray(a1)
 
-        log_prob = jnp.sum(jax.scipy.stats.norm.logpdf(a1, action_mean, action_std))
-        entropy = jnp.sum(0.5 * (jnp.log(2 * jnp.pi * action_std**2) + 1))
+        log_probs = jax.scipy.stats.norm.logpdf(a1, action_mean, action_std)
+        entropies = 0.5 * (jnp.log(2 * jnp.pi * action_std**2) + 1)
+
+        if evolving_out:
+            log_prob = jax.vmap(jnp.sum)(log_probs)
+            entropy = jax.vmap(jnp.sum)(entropies)
+        else:
+            log_prob = jnp.sum(log_probs)
+            entropy = jnp.sum(entropies)
 
         return z1, a1, log_prob, entropy, value
 
@@ -204,35 +234,46 @@ class CDEAgent(eqx.Module):
 
 
 @chex.dataclass
-class RolloutBuffer:
-    """Meant to be used as a return value for a rollout scan."""
+class EpisodeState:
+    step: Int[Array, ""]
+    env_state: gym.EnvState
+    observations: Float[Array, " num_steps observation_size"]
+    times: Float[Array, " num_steps"]
+    initial_agent_state: Float[Array, " state_size"]
 
-    observations: Float[Array, " *N observation_size"]
-    actions: Float[Array, " *N action_size"]
-    log_probs: Float[Array, " *N"]
-    entropies: Float[Array, " *N"]
-    values: Float[Array, " *N"]
-    rewards: Float[Array, " *N"]
-    terminations: Bool[Array, " *N"]
-    truncations: Bool[Array, " *N"]
-    advantages: Float[Array, " *N"]
-    returns: Float[Array, " *N"]
-    times: Float[Array, " *N"]
-    states: Float[Array, " *N state_size"]
+
+@chex.dataclass
+class EpisodesRollout:
+    """Rollout of multiple episodes.
+
+    The history of the environment and agent states are stored in the rollout
+    and the initial state. This can be used to train the agent on rollouts with
+    a full backpropagation through time.
+
+    Episodes can be padded with NaNs to match the number of steps in the PPO arguments.
+    Additionally extra episodes can be padded to match the number of steps in the PPO arguments.
+    """
+
+    observations: Float[Array, " *N num_steps observation_size"]
+    actions: Float[Array, " *N num_steps action_size"]
+    log_probs: Float[Array, " *N num_steps"]
+    entropies: Float[Array, " *N num_steps"]
+    values: Float[Array, " *N num_steps"]
+    rewards: Float[Array, " *N num_steps"]
+    terminations: Bool[Array, " *N num_steps"]
+    truncations: Bool[Array, " *N num_steps"]
+    advantages: Float[Array, " *N num_steps"]
+    returns: Float[Array, " *N num_steps"]
+    times: Float[Array, " *N num_steps"]
+    initial_agent_state: Float[
+        Array, " *N num_steps state_size"
+    ]  # Stores duplicates for easier computation
 
 
 @chex.dataclass
 class TrainingState:
-    """Meant to be used as a carry value during training or rollout scanning."""
-
-    env_state: gym.EnvState
     opt_state: optax.OptState
-    observation: Float[Array, " observation_size"]
     global_step: Int[Array, ""]
-    last_observation: Float[Array, " observation_size"]
-    agent_time: Float[Array, ""]
-    last_agent_time: Float[Array, ""]
-    agent_state: Float[Array, " state_size"]
 
 
 @chex.dataclass
@@ -259,6 +300,8 @@ class PPOArguments:
     target_kl: float | None
     minibatch_size: int
     num_iterations: int
+    learning_rate: float
+    anneal_learning_rate: bool
 
 
 def make_empty(cls, **kwargs):
@@ -277,37 +320,40 @@ def reset(
     env: environment.Environment,
     env_params: gym.EnvParams,
     agent: CDEAgent,
-    training_state: TrainingState,
+    args: PPOArguments,
     *,
     key: Key,
-) -> TrainingState:
+) -> EpisodeState:
     """Reset the environment and agent to a fresh state.
 
     Arguments:
     - env: Environment to reset.
     - env_params: Parameters for the environment.
     - agent: Agent to reset.
-    - training_state: Current training state.
+    - args: PPO arguments.
     - key: Random key for resetting the environment.
 
     Returns:
     - training_state: A fresh training state.
     """
     env_key, agent_key = jr.split(key, 2)
+
     observation, env_state = env.reset(env_key, env_params)
+    observations = jnp.full(
+        (args.num_steps, observation.shape[0]), jnp.nan, dtype=observation.dtype
+    )
+    observations = observations.at[0].set(observation)
 
-    agent_time = jnp.array(0.0)
-    agent_state = agent.initial_state(agent_time, observation, key=agent_key)
+    agent_times = jnp.full((args.num_steps,), jnp.nan, dtype=jnp.array(0.0).dtype)
+    agent_times = agent_times.at[0].set(jnp.array(0.0))
+    agent_state = agent.initial_state(agent_times[0], observations[0], key=agent_key)
 
-    return TrainingState(
+    return EpisodeState(
+        step=jnp.array(0),  # Start at 1 to account for the initial state.
         env_state=env_state,
-        opt_state=training_state.opt_state,
-        observation=observation,
-        last_observation=observation,
-        agent_time=agent_time,
-        last_agent_time=agent_time - 1e-3,
-        agent_state=agent_state,
-        global_step=training_state.global_step,
+        observations=observations,
+        times=agent_times,
+        initial_agent_state=agent_state,
     )
 
 
@@ -315,194 +361,305 @@ def env_step(
     env: environment.Environment,
     env_params: gym.EnvParams,
     agent: CDEAgent,
-    training_state: TrainingState,
+    episode_state: EpisodeState,
+    args: PPOArguments,
     *,
     key: Key,
-) -> tuple[TrainingState, RolloutBuffer]:
+) -> tuple[EpisodeState, EpisodesRollout]:
     """Step the environment and agent forward one step and store the data in a rollout buffer.
 
     Arguments:
     - env: Environment to interact with.
     - env_params: Parameters for the environment.
     - agent: Agent to interact with the environment.
-    - training_state: Current training state.
+    - episode_state: Current episode state.
+    - args: PPO arguments.
     - key: Random key for sampling.
 
     Returns:
-    - [carry[training_state, key], rollout_step]: New training state and key, and rollout buffer with the current step data.
+    - episode_state: New episode state.
+    - buffer: Buffer of data from the episode step.
     """
     actor_key, env_key, reset_key = jr.split(key, 3)
 
-    # Store the current state
-    buffer = make_empty(RolloutBuffer)
-    buffer.observations = training_state.observation
-    buffer.times = training_state.agent_time
-    buffer.states = training_state.agent_state
-
-    # Get the agent action and state from the current state
-    agent_state, action, log_prob, entropy, value = agent.get_action_and_value(
-        jnp.asarray([training_state.last_agent_time, training_state.agent_time]),
-        jnp.asarray([training_state.last_observation, training_state.observation]),
-        training_state.agent_state,
+    _, action, log_prob, entropy, value = agent.get_action_and_value(
+        episode_state.times,
+        episode_state.observations,
+        episode_state.initial_agent_state,
         key=actor_key,
     )
-    # Store the agent action and state
-    buffer.actions = action
-    buffer.log_probs = log_prob
-    buffer.entropies = entropy
-    buffer.values = value
 
-    # Get the next state and reward from the environment
+    buffer = make_empty(
+        EpisodesRollout,
+        observations=episode_state.observations[episode_state.step],
+        actions=action,
+        times=episode_state.times[episode_state.step],
+        initial_agent_state=episode_state.initial_agent_state,
+    )
+
     clipped_action = jnp.clip(
         action, env.action_space(env_params).low, env.action_space(env_params).high
     )
     observation, env_state, reward, done, info = env.step(
-        env_key, training_state.env_state, clipped_action, env_params
+        env_key, episode_state.env_state, clipped_action, env_params
     )
+    observation = jnp.clip(observation, -10.0, 10.0)
     termination = done
     truncation = jnp.array(False)
-    # Store the environment state and reward
+
     buffer.rewards = reward
     buffer.terminations = termination
     buffer.truncations = truncation
+    buffer.log_probs = log_prob
+    buffer.entropies = entropy
+    buffer.values = value
 
-    # Update the training state
-    training_state.env_state = env_state
-    training_state.last_observation = training_state.observation
-    training_state.observation = observation
-    training_state.last_agent_time = training_state.agent_time
-    training_state.agent_time += 1.0
-    training_state.agent_state = agent_state
-    training_state.global_step += 1
-
-    # Reset if needed
-    training_state = jax.lax.cond(
-        jnp.logical_or(termination, truncation),
-        lambda: reset(env, env_params, agent, training_state, key=reset_key),
-        lambda: training_state,
+    episode_state.step += 1
+    episode_state.env_state = env_state
+    episode_state.observations = episode_state.observations.at[episode_state.step].set(
+        observation
+    )
+    episode_state.times = episode_state.times.at[episode_state.step].set(
+        episode_state.times[episode_state.step - 1] + 1e-3
     )
 
-    return training_state, buffer
+    episode_state = jax.lax.cond(
+        termination | truncation,
+        lambda: reset(env, env_params, agent, args, key=reset_key),
+        lambda: episode_state,
+    )
+
+    return episode_state, buffer
 
 
-def collect_stateful_ppo_rollout(
+def split_into_episodes(
+    rollout: EpisodesRollout, args: PPOArguments
+) -> EpisodesRollout:
+    """Split a rollout of multiple episodes into multiple episodes.
+
+    Episodes are padded to `args.num_steps`.
+    The number of episodes is also padded to `args.num_steps`.
+
+    Arguments:
+    - rollout: Rollout of multiple concatenated episodes.
+    - args: PPO arguments.
+
+    Returns:
+    - rollout: Batched rollout of episodes.
+      Padded to match the number of steps in the PPO arguments.
+    """
+
+    def body_fn(
+        carry: tuple[int, int, PyTree], idx: Int[Array, ""]
+    ) -> tuple[tuple[int, int, PyTree], None]:
+        """Fill the batched rollout with the data from the current step."""
+        ep_idx, step_idx, out_tree = carry
+
+        current_data = jax.tree.map(lambda x: x[idx], rollout)
+        out_tree = jax.tree.map(
+            lambda arr, x: arr.at[ep_idx, step_idx].set(x),
+            out_tree,
+            current_data,
+        )
+        new_carry = (ep_idx, step_idx + 1, out_tree)
+        new_carry = jax.lax.cond(
+            rollout.terminations[idx] | rollout.truncations[idx],
+            lambda c: (c[0] + 1, 0, c[2]),
+            lambda c: c,
+            new_carry,
+        )
+        return new_carry, None
+
+    empty_tree = jax.tree.map(
+        lambda x: jnp.full(
+            (args.num_steps, args.num_steps) + x.shape[1:], jnp.nan, dtype=x.dtype
+        ),
+        rollout,
+    )
+
+    init_carry = (0, 0, empty_tree)
+    (_, _, out_tree), _ = jax.lax.scan(body_fn, init_carry, jnp.arange(args.num_steps))
+
+    return EpisodesRollout(**out_tree)
+
+
+def collect_ppo_rollout(
     env: environment.Environment,
     env_params: gym.EnvParams,
     agent: CDEAgent,
+    episode_state: EpisodeState,
     training_state: TrainingState,
     args: PPOArguments,
     *,
     key: Key,
-) -> tuple[TrainingState, RolloutBuffer]:
-    def scan_env_step(
-        carry: tuple[TrainingState, Key], _
-    ) -> tuple[tuple[TrainingState, Key], RolloutBuffer]:
-        training_state, key = carry
+) -> tuple[EpisodeState, TrainingState, EpisodesRollout]:
+    """Collect a PPO rollout from the environment and agent.
+
+    Collects some number of episodes such that the total number of steps
+    matches the number of steps in the PPO arguments.
+
+    Returns:
+    - episode_state: New episode state.
+    - training_state: New training state.
+    - episodes: Rollout of episodes.
+    """
+
+    def scan_step(
+        carry: tuple[EpisodeState, Key],
+        _: None,
+    ) -> tuple[tuple[EpisodeState, Key], EpisodesRollout]:
+        """Wrapper for env_step to be used in jax.lax.scan."""
+        episode_state, key = carry
         carry_key, step_key = jr.split(key, 2)
 
-        training_state, rollout_step = env_step(
-            env, env_params, agent, training_state, key=step_key
+        episode_state, buffer = env_step(
+            env, env_params, agent, episode_state, args, key=step_key
         )
+        return (episode_state, carry_key), buffer
 
-        return (training_state, carry_key), rollout_step
-
-    (training_state, _), rollout = jax.lax.scan(
-        scan_env_step,
-        (training_state, key),
-        length=args.num_steps,
+    (episode_state, _), rollout = jax.lax.scan(
+        scan_step, (episode_state, key), length=args.num_steps
     )
 
-    return training_state, rollout
+    episodes = split_into_episodes(rollout, args)
+
+    return episode_state, training_state, episodes
 
 
-def compute_gae(
-    agent: CDEAgent,
-    rollout: RolloutBuffer,
-    training_state: TrainingState,
+def compute_gae_episode(
+    rewards: Float[Array, " num_steps"],
+    values: Float[Array, " num_steps"],
+    terminations: Bool[Array, " num_steps"],
+    truncations: Bool[Array, " num_steps"],
     args: PPOArguments,
-) -> RolloutBuffer:
-    next_value = agent.get_value(
-        ts=jnp.asarray([training_state.last_agent_time, training_state.agent_time]),
-        xs=jnp.asarray([training_state.last_observation, training_state.observation]),
-        z0=training_state.agent_state,
-    )
+) -> tuple[Float[Array, " num_steps"], Float[Array, " num_steps"]]:
+    """
+    Compute GAE advantages and bootstrapped returns for an episode with nan padding.
+    Assumes that valid (non‑nan) entries come first, followed by all nans.
 
-    next_non_terminals = jnp.concatenate(
-        [
-            1.0
-            - jnp.logical_or(rollout.terminations[1:], rollout.truncations[1:]).astype(
-                jnp.float32
-            ),
-            jnp.array(
-                [
-                    1.0
-                    - jnp.logical_or(
-                        rollout.terminations[-1], rollout.truncations[-1]
-                    ).astype(jnp.float32)
-                ]
-            ),
-        ],
-        axis=0,
-    )
+    Arguments:
+    - rewards: Rewards for the episode.
+    - values: Values for the episode.
+    - terminations: Terminations for the episode.
+    - truncations: Truncations for the episode.
+    - args: PPO arguments.
 
-    next_values = jnp.concatenate([rollout.values[1:], jnp.array([next_value])], axis=0)
+    Returns:
+    - returns: Bootstrapped returns for the episode.
+    - advantages: GAE advantages for the episode.
+    """
+    dones = terminations | truncations
+    T = rewards.shape[0]
+    num_valid = jnp.sum(~jnp.isnan(rewards)).astype(jnp.int64)
+    idxs = jnp.arange(T)
 
     def scan_fn(
-        carry: Float[Array, ""],
-        x: tuple[
-            Float[Array, ""], Float[Array, ""], Float[Array, ""], Float[Array, ""]
-        ],
+        carry: Float[Array, ""], t: Int[Array, ""]
     ) -> tuple[Float[Array, ""], Float[Array, ""]]:
-        reward, value, next_non_terminal, next_value_ = x
-        delta = reward + args.gamma * next_value_ - value
-        new_carry = delta + args.gamma * args.gae_lambda * next_non_terminal * carry
-        return new_carry, new_carry
+        valid_idx = t < num_valid
+        is_last_valid = t == (num_valid - 1)
+        next_value = jax.lax.cond(
+            is_last_valid,
+            lambda: jnp.where(dones[t], 0.0, values[t]),
+            lambda: values[t + 1],
+        )
+        delta = rewards[t] + args.gamma * next_value * (1.0 - dones[t]) - values[t]
+        adv_next = jnp.where(is_last_valid, 0.0, carry)
+        adv = delta + args.gamma * args.gae_lambda * adv_next * (1.0 - dones[t])
+        adv = jnp.where(valid_idx, adv, jnp.nan)
+        new_carry = jnp.where(valid_idx, adv, carry)
+        return new_carry, adv
 
-    _, advantages_reversed = jax.lax.scan(
-        scan_fn,
-        jnp.array(0.0),
-        (rollout.rewards, rollout.values, next_non_terminals, next_values),
-        reverse=True,
+    rev_idxs = jnp.arange(T - 1, -1, -1)
+    _, adv_rev = jax.lax.scan(scan_fn, jnp.array(0.0), rev_idxs)
+    advantages = jnp.flip(adv_rev)
+    returns = jnp.where(idxs < num_valid, advantages + values, jnp.nan)
+    return returns, advantages
+
+
+def compute_gae(episodes: EpisodesRollout, args: PPOArguments) -> EpisodesRollout:
+    """
+    Compute GAE advantages and bootstrapped returns for an EpisodesRollout.
+
+    Args:
+    - episodes: An EpisodesRollout with fields rewards, values, terminations, truncations.
+        Note that `values` is shape [num_episodes, num_steps] (one value per step).
+    - args: PPOArguments with gamma and gae_lambda.
+
+    Returns:
+    - episodes: An EpisodesRollout with advantage and return fields.
+    """
+
+    returns, advantages = jax.vmap(partial(compute_gae_episode, args=args))(
+        episodes.rewards, episodes.values, episodes.terminations, episodes.truncations
     )
-    advantages = jnp.flip(advantages_reversed, axis=0)
-    returns = advantages + rollout.values
 
-    rollout = dataclasses.replace(rollout, advantages=advantages, returns=returns)
-    return rollout
+    return EpisodesRollout(
+        observations=episodes.observations,
+        actions=episodes.actions,
+        log_probs=episodes.log_probs,
+        entropies=episodes.entropies,
+        values=episodes.values,
+        rewards=episodes.rewards,
+        terminations=episodes.terminations,
+        truncations=episodes.truncations,
+        advantages=advantages,
+        returns=returns,
+        times=episodes.times,
+        initial_agent_state=episodes.initial_agent_state,
+    )
 
 
-def loss(
+def episode_loss(
     agent: CDEAgent,
-    training_state: TrainingState,
-    rollout: RolloutBuffer,
+    times: Float[Array, " N"],
+    observations: Float[Array, " N observation_size"],
+    initial_agent_state: Float[Array, " N state_size"],
+    actions: Float[Array, " N action_size"],
+    log_probs: Float[Array, " N"],
+    values: Float[Array, " N"],
+    advantages: Float[Array, " N"],
+    returns: Float[Array, " N"],
     args: PPOArguments,
 ) -> tuple[Float[Array, ""], PPOStats]:
-    times_full = jnp.concatenate(
-        [rollout.times, jnp.expand_dims(training_state.agent_time, axis=0)]
+    """Compute the PPO loss for a single episode.
+
+    Safe to use on episodes with NaN padding.
+    Returns NaN for the loss and stats if the episode is entirely NaN.
+
+    Arguments:
+    - agent: Agent to compute the loss for.
+    - times: Time steps of the episode.
+    - observations: Observations of the episode.
+    - initial_agent_state: Initial state of the agent.
+      Should be the same for all steps in the episode.
+    - actions: Actions taken in the episode.
+    - log_probs: Log probabilities of the actions.
+    - values: Values of the states.
+    - advantages: GAE advantages.
+    - returns: Bootstrapped returns.
+    - args: PPO arguments.
+
+    Returns:
+    - loss: PPO loss for the episode.
+    - stats: PPO stats for the episode.
+    """
+    _, _, new_log_probs, new_entropies, new_values = agent.get_action_and_value(
+        times, observations, initial_agent_state[0], actions, evolving_out=True
     )
-    obs_full = jnp.concatenate(
-        [rollout.observations, jnp.expand_dims(training_state.observation, axis=0)]
-    )
 
-    t_pairs = jnp.stack([times_full[:-1], times_full[1:]], axis=1)
-    x_pairs = jnp.stack([obs_full[:-1], obs_full[1:]], axis=1)
-
-    _, _, new_log_probs, new_entropies, new_values = jax.vmap(
-        agent.get_action_and_value
-    )(t_pairs, x_pairs, rollout.states, rollout.actions)
-
-    log_ratio = new_log_probs - rollout.log_probs
+    log_ratio = new_log_probs - log_probs
     ratio = jnp.exp(log_ratio)
-    approx_kl = jnp.mean(ratio - log_ratio) - 1.0
+    approx_kl = jnp.nanmean(ratio - log_ratio) - 1.0
 
     if args.normalize_advantage:
-        advantages = (rollout.advantages - jnp.mean(rollout.advantages)) / (
-            jnp.std(rollout.advantages) + 1e-8
+        advantages = (advantages - jnp.nanmean(advantages)) / (
+            jnp.nanstd(advantages) + 1e-8
         )
     else:
-        advantages = rollout.advantages
+        advantages = advantages
 
-    policy_loss = -jnp.mean(
+    policy_loss = -jnp.nanmean(
         jnp.minimum(
             advantages * ratio,
             advantages
@@ -511,23 +668,23 @@ def loss(
     )
 
     if args.clip_value_loss:
-        clipped_values = rollout.values + jnp.clip(
-            new_values - rollout.values, -args.clip_coefficient, args.clip_coefficient
+        clipped_values = values + jnp.clip(
+            new_values - values, -args.clip_coefficient, args.clip_coefficient
         )
         value_loss = (
-            jnp.mean(
+            jnp.nanmean(
                 jnp.maximum(
-                    jnp.square(new_values - rollout.returns),
-                    jnp.square(clipped_values - rollout.returns),
+                    jnp.square(new_values - returns),
+                    jnp.square(clipped_values - returns),
                 )
             )
             / 2.0
         )
     else:
-        value_loss = jnp.mean(jnp.square(new_values - rollout.returns)) / 2.0
+        value_loss = jnp.nanmean(jnp.square(new_values - returns)) / 2.0
 
-    entropy_loss = jnp.mean(new_entropies)
-    loss = (
+    entropy_loss = jnp.nanmean(new_entropies)
+    total_loss = (
         policy_loss
         + args.value_coefficient * value_loss
         - args.entropy_coefficient * entropy_loss
@@ -535,22 +692,47 @@ def loss(
 
     stats = make_empty(
         PPOStats,
-        total_loss=loss,
+        total_loss=total_loss,
         policy_loss=policy_loss,
         value_loss=value_loss,
         entropy_loss=entropy_loss,
         approx_kl=approx_kl,
     )
 
-    return loss, stats
+    return total_loss, stats
 
 
-loss_grad = eqx.filter_value_and_grad(loss, has_aux=True)
+def batch_loss(
+    agent: CDEAgent, rollout: EpisodesRollout, args: PPOArguments
+) -> tuple[Float[Array, " *N"], PPOStats]:
+    """Compute the PPO loss for a batch of episodes."""
+
+    total_loss, stats = jax.vmap(partial(episode_loss, agent, args=args))(
+        rollout.times,
+        rollout.observations,
+        rollout.initial_agent_state,
+        rollout.actions,
+        rollout.log_probs,
+        rollout.values,
+        rollout.advantages,
+        rollout.returns,
+    )
+
+    total_loss = jnp.nanmean(total_loss)
+    stats = jax.tree_map(jnp.nanmean, stats)
+
+    total_loss = jnp.where(jnp.isnan(total_loss), 0.0, total_loss)
+
+    return total_loss, stats
+
+
+loss_grad = eqx.filter_value_and_grad(batch_loss, has_aux=True)
 
 
 def get_batch_indices(
     batch_size: int, dataset_size: int, *, key: Key | None = None
 ) -> Int[Array, " {dataset_size // batch_size} {batch_size}"]:
+    """Get batch indices for a dataset of a given size."""
     indices = jnp.arange(dataset_size)
 
     if key is not None:
@@ -565,15 +747,16 @@ def get_batch_indices(
 
 def train_on_batch(
     agent: CDEAgent,
-    training_state: TrainingState,
     optimizer: optax.GradientTransformation,
     opt_state: optax.OptState,
-    rollout: RolloutBuffer,
+    rollout: EpisodesRollout,
     batch_indices: Int[Array, " N"],
     args: PPOArguments,
 ) -> tuple[CDEAgent, optax.OptState, PPOStats]:
+    """Take a training step on a batch of episodes."""
     rollout = jax.tree.map(lambda x: x[batch_indices], rollout)
-    (_, stats), grads = loss_grad(agent, training_state, rollout, args)
+    (_, stats), grads = loss_grad(agent, rollout, args)
+
     updates, opt_state = optimizer.update(grads, opt_state)
     agent = eqx.apply_updates(agent, updates)
 
@@ -582,10 +765,9 @@ def train_on_batch(
 
 def epoch(
     agent: CDEAgent,
-    training_state: TrainingState,
     optimizer: optax.GradientTransformation,
     opt_state: optax.OptState,
-    rollout: RolloutBuffer,
+    rollout: EpisodesRollout,
     args: PPOArguments,
     *,
     key: Key | None = None,
@@ -598,7 +780,7 @@ def epoch(
         agent_dynamic, opt_state = carry
         agent = eqx.combine(agent_dynamic, agent_static)
         agent, opt_state, stats = train_on_batch(
-            agent, training_state, optimizer, opt_state, rollout, xs, args
+            agent, optimizer, opt_state, rollout, xs, args
         )
         agent_dynamic, _ = eqx.partition(agent, eqx.is_array)
         return (agent_dynamic, opt_state), stats
@@ -618,10 +800,9 @@ def epoch(
 
 def train_on_rollout(
     agent: CDEAgent,
-    training_state: TrainingState,
     optimizer: optax.GradientTransformation,
     opt_state: optax.OptState,
-    rollout: RolloutBuffer,
+    rollout: EpisodesRollout,
     args: PPOArguments,
     *,
     key: Key | None = None,
@@ -641,7 +822,7 @@ def train_on_rollout(
             carry_key, batch_key = None, None
 
         agent, opt_state, stats = epoch(
-            agent, training_state, optimizer, opt_state, rollout, args, key=batch_key
+            agent, optimizer, opt_state, rollout, args, key=batch_key
         )
 
         agent_dynamic, _ = eqx.partition(agent, eqx.is_array)
@@ -658,48 +839,71 @@ def train_on_rollout(
     return agent, opt_state, stats
 
 
+@eqx.filter_jit
 def train(
     env: environment.Environment,
     env_params: gym.EnvParams,
-    optimizer: optax.GradientTransformation,
     agent: CDEAgent,
     args: PPOArguments,
     *,
-    key=Key,
+    key: Key,
 ) -> CDEAgent:
     agent_dynamic, agent_static = eqx.partition(agent, eqx.is_array)
 
-    def scan_step(
-        carry: tuple[TrainingState, PyTree, optax.OptState, Key], xs: None
-    ) -> tuple[tuple[TrainingState, PyTree, optax.OptState, Key], PyTree]:
-        training_state, agent_dynamic, opt_state, key = carry
-        agent = eqx.combine(agent_dynamic, agent_static)
-        rollout_key, training_key = jr.split(key, 2)
+    if args.anneal_learning_rate:
+        schedule = optax.schedules.cosine_decay_schedule(
+            args.learning_rate,
+            args.num_iterations
+            * args.num_epochs
+            * args.num_steps
+            // args.minibatch_size,
+        )
+    else:
+        schedule = optax.constant_schedule(args.learning_rate)
 
-        training_state, rollout = collect_stateful_ppo_rollout(
-            env, env_params, agent, training_state, args, key=rollout_key
+    adam = optax.inject_hyperparams(optax.adam)(learning_rate=schedule, eps=1e-5)
+    optimizer = optax.named_chain(
+        ("clipping", optax.clip_by_global_norm(args.max_gradient_norm)), ("adam", adam)
+    )
+
+    @eqx.filter_jit
+    def scan_step(
+        carry: tuple[TrainingState, EpisodeState, PyTree, optax.OptState, Key], _: None
+    ) -> tuple[tuple[TrainingState, EpisodeState, PyTree, optax.OptState, Key], PyTree]:
+        training_state, episode_state, agent_dynamic, opt_state, key = carry
+        agent = eqx.combine(agent_dynamic, agent_static)
+        carry_key, rollout_key, training_key = jr.split(key, 3)
+
+        episode_state, training_state, rollout = collect_ppo_rollout(
+            env, env_params, agent, episode_state, training_state, args, key=rollout_key
         )
 
-        rollout = compute_gae(agent, rollout, training_state, args)
+        rollout = compute_gae(rollout, args)
 
         agent, opt_state, stats = train_on_rollout(
-            agent, training_state, optimizer, opt_state, rollout, args, key=training_key
+            agent, optimizer, opt_state, rollout, args, key=training_key
         )
 
         agent_dynamic, _ = eqx.partition(agent, eqx.is_array)
 
-        return (training_state, agent_dynamic, opt_state, key), stats
+        return (
+            training_state,
+            episode_state,
+            agent_dynamic,
+            opt_state,
+            carry_key,
+        ), stats
 
     opt_state = optimizer.init(eqx.filter(agent, eqx.is_inexact_array))
     reset_key, training_key = jr.split(key, 2)
     training_state = make_empty(
         TrainingState, global_step=jnp.array(0), opt_state=opt_state
     )
-    training_state = reset(env, env_params, agent, training_state, key=reset_key)
+    episode_state = reset(env, env_params, agent, args, key=reset_key)
 
-    (training_state, agent_dynamic, opt_state, _), _ = jax.lax.scan(
+    (training_state, episode_state, agent_dynamic, opt_state, _), _ = jax.lax.scan(
         scan_step,
-        (training_state, agent_dynamic, opt_state, training_key),
+        (training_state, episode_state, agent_dynamic, opt_state, training_key),
         length=args.num_iterations,
     )
 
@@ -709,12 +913,24 @@ def train(
 
 
 if __name__ == "__main__":
-    args = make_empty(
-        PPOArguments,
+    key: Key = jr.key(0)
+    env, env_params = gym.make("Pendulum-v1")
+
+    agent = CDEAgent(
+        env=env,
+        env_params=env_params,
+        hidden_size=4,
+        processed_size=16,
+        width_size=64,
+        depth=2,
+        key=key,
+    )
+
+    args = PPOArguments(
         num_steps=1024,
         gamma=0.93,
         gae_lambda=0.95,
-        num_epochs=4,
+        num_epochs=16,
         normalize_advantage=True,
         clip_coefficient=0.2,
         clip_value_loss=True,
@@ -723,24 +939,9 @@ if __name__ == "__main__":
         max_gradient_norm=0.5,
         target_kl=None,
         minibatch_size=64,
-        num_iterations=1024,
+        num_iterations=128,
+        learning_rate=1e-3,
+        anneal_learning_rate=True,
     )
 
-    key = jr.key(0)
-    agent_key, reset_key, rollout_key = jr.split(key, 3)
-
-    env, env_params = gym.make("Pendulum-v1")
-
-    agent = CDEAgent(
-        env=env,
-        env_params=env_params,
-        hidden_size=16,
-        processed_size=16,
-        width_size=64,
-        depth=2,
-        key=agent_key,
-    )
-
-    optimizer = optax.adam(1e-3)
-
-    agent = train(env, env_params, optimizer, agent, args, key=rollout_key)
+    agent = train(env, env_params, agent, args, key=key)
