@@ -7,7 +7,7 @@ import jax
 import jax.nn as jnn
 import jax.numpy as jnp
 import jax.random as jr
-from jax import Array
+from jaxtyping import Array
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +102,7 @@ class NeuralCDE(eqx.Module):
     output: eqx.nn.MLP
 
     input_size: int | Literal["scalar"]
+    output_size: int | Literal["scalar"]
 
     def __init__(
         self,
@@ -142,6 +143,7 @@ class NeuralCDE(eqx.Module):
         ikey, fkey, okey = jr.split(key, 3)
 
         self.input_size = input_size
+        self.output_size = output_size
 
         if input_size == "scalar":
             input_size = 1
@@ -178,8 +180,28 @@ class NeuralCDE(eqx.Module):
         )
 
     def __call__(
-        self, ts: Array, xs: Array, z0: Array, evolving_out: bool = False
+        self,
+        ts: Array,
+        xs: Array,
+        z0: Array,
+        *,
+        evolving_out: bool = False,
     ) -> tuple[Array, Array]:
+        """Compute the output of the Neural CDE.
+
+        Evaluates the Neural CDE at a series of times and inputs using cubic
+        hermite splines with backward differences.
+
+        Arguments:
+        - ts: The times to evaluate the Neural CDE.
+        - xs: The inputs to the Neural CDE.
+        - z0: The initial state of the Neural CDE.
+        - evolving_out: If True, return the output at each time step.
+
+        Returns:
+        - z1: The final state of the Neural CDE.
+        - y1: The output of the Neural CDE.
+        """
         if self.input_size == "scalar":
             assert xs.ndim == 1
             xs = jnp.expand_dims(xs, axis=-1)
@@ -206,11 +228,13 @@ class NeuralCDE(eqx.Module):
         else:
             saveat = diffrax.SaveAt(t1=True)
 
+        t1 = jnp.nanmax(ts)
+
         solution = diffrax.diffeqsolve(
             term,
             solver=solver,
             t0=ts[0],
-            t1=ts[-1],
+            t1=t1,
             dt0=None,
             y0=z0,
             stepsize_controller=stepsize_controller,
@@ -218,11 +242,13 @@ class NeuralCDE(eqx.Module):
         )
 
         assert solution.ys is not None
+        ys = solution.ys
 
         if evolving_out:
-            return solution.ys, jax.vmap(self.output)(solution.ys)
+            ys = jnp.where(jnp.isnan(ts[:, None]), jnp.nan, ys)
+            return ys, jax.vmap(self.output)(ys)
         else:
-            return solution.ys[-1], self.output(solution.ys[-1])
+            return ys[-1], self.output(ys[-1])
 
     def initial_state(self, t0: float | Array, x0: Array) -> Array:
         """Return an initial state for the given input and time.
