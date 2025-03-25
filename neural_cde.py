@@ -189,6 +189,9 @@ class NeuralCDE(eqx.Module):
         assert z0.ndim == 1
         assert xs.shape[0] == ts.shape[0]
 
+        if len(ts) == 1:
+            return z0, self.output(z0)
+
         # Create a control term with a cubic interpolation of the input
         xs = jnp.concatenate([ts[:, None], xs], axis=1)  # Add time to input
         coeffs = diffrax.backward_hermite_coefficients(ts, xs)
@@ -342,7 +345,7 @@ if __name__ == "__main__":
         model: NeuralCDE, ts_batch: Array, xs_batch: Array, y1_batch: Array
     ) -> tuple[Array, Array]:
         """Compute the loss of a batch of control inputs and labels"""
-        z0_batch = jax.vmap(model.initial_state)(xs_batch[:, 0], ts_batch[:, 0])
+        z0_batch = jax.vmap(model.initial_state)(ts_batch[:, 0], xs_batch[:, 0])
         _, prediction_batch = jax.vmap(model)(ts_batch, xs_batch, z0_batch)
         error_batch = jax.vmap(jnp.linalg.norm)(prediction_batch - y1_batch)
         return jnp.mean(error_batch), prediction_batch
@@ -421,9 +424,9 @@ if __name__ == "__main__":
             key=key,
         )
     )(jr.split(data_key, dataset_size), jnp.linspace(0, 1, dataset_size))
-    loss, prediction = loss(neural_cde, ts_test, xs_test, y1_test)
+    _loss, prediction = loss(neural_cde, ts_test, xs_test, y1_test)
 
-    print(f"Test Loss: {loss}")
+    print(f"Test Loss: {_loss}")
     print(f"Predicted Matrix: {prediction[0]}")
     print(f"True Matrix: {y1_test[0]}")
 
@@ -436,7 +439,7 @@ if __name__ == "__main__":
     _, prediction = neural_cde(
         ts_test[0],
         xs_test[0],
-        neural_cde.inital(xs_test[0][0], ts_test[0][0]),
+        neural_cde.initial_state(ts_test[0][0], xs_test[0][0]),
         evolving_out=True,
     )
 
@@ -451,7 +454,7 @@ if __name__ == "__main__":
         points = xy.reshape(-1, 1, 2)
         segments = np.concatenate([points[:-1], points[1:]], axis=1)
         lc = LineCollection(
-            segments,
+            segments,  # pyright: ignore
             cmap=cmap,
             array=np.arange(len(segments)),
             label=label,
