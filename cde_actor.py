@@ -7,14 +7,17 @@ import equinox as eqx
 import gymnax as gym
 import jax
 import optax
+from gymnax import wrappers
 from gymnax.environments import environment
 from jax import numpy as jnp
 from jax import random as jr
 from jaxtyping import Array, ArrayLike, Bool, Float, Int, Key, PyTree
+from torch.utils.tensorboard.writer import SummaryWriter
 
 from neural_cde import NeuralCDE
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 
 class CDEAgent(eqx.Module):
@@ -310,6 +313,18 @@ def reset(
         jr.uniform(time_key, (), minval=0.0, maxval=1.0)
     )
 
+    # Fix the LogWrapper typing
+    env_state = eqx.tree_at(
+        lambda s: s.episode_returns,
+        env_state,
+        replace_fn=lambda x: jnp.astype(x, jnp.float64),
+    )
+    env_state = eqx.tree_at(
+        lambda s: s.returned_episode_returns,
+        env_state,
+        replace_fn=lambda x: jnp.astype(x, jnp.float64),
+    )
+
     return EpisodeState(
         step=jnp.array(0),  # Start at 1 to account for the initial state.
         env_state=env_state,
@@ -344,10 +359,11 @@ def env_step(
     env_params: gym.EnvParams,
     agent: CDEAgent,
     episode_state: EpisodeState,
+    training_state: TrainingState,
     args: PPOArguments,
     *,
     key: Key,
-) -> tuple[EpisodeState, EpisodesRollout]:
+) -> tuple[EpisodeState, TrainingState, EpisodesRollout, dict]:
     """Step the environment and agent forward one step and store the data in a rollout buffer.
 
     Arguments:
@@ -355,12 +371,14 @@ def env_step(
     - env_params: Parameters for the environment.
     - agent: Agent to interact with the environment.
     - episode_state: Current episode state.
+    - training_state: Current training state.
     - args: PPO arguments.
     - key: Random key for sampling.
 
     Returns:
     - episode_state: New episode state.
     - buffer: Buffer of data from the episode step.
+    - info: Information about the episode step.
     """
     actor_key, env_key, reset_key = jr.split(key, 3)
 
@@ -411,8 +429,11 @@ def env_step(
         lambda: reset(env, env_params, args, key=reset_key),
         lambda: episode_state,
     )
+    training_state = TrainingState(
+        opt_state=training_state.opt_state, global_step=training_state.global_step + 1
+    )
 
-    return episode_state, buffer
+    return episode_state, training_state, buffer, info
 
 
 def split_into_episodes(
@@ -475,6 +496,7 @@ def collect_ppo_rollout(
     args: PPOArguments,
     *,
     key: Key,
+    writer: SummaryWriter | None = None,
 ) -> tuple[EpisodeState, TrainingState, EpisodesRollout]:
     """Collect a PPO rollout from the environment and agent.
 
@@ -486,24 +508,59 @@ def collect_ppo_rollout(
     - training_state: New training state.
     - episodes: Rollout of episodes.
     """
+
+    def write_episode_stats(info: dict[str, Array], global_step: Array):
+        r = info["returned_episode_returns"]
+        l = info["returned_episode_lengths"]
+        jax.debug.callback(
+            lambda r, l: logger.debug(
+                f"Episode finished with reward {r} and length {l}"
+            ),
+            r,
+            l,
+            ordered=True,
+        )
+        jax.debug.callback(
+            lambda r, global_step: writer.add_scalar(
+                "episode/reward", float(r), int(global_step)
+            ),
+            r,
+            global_step,
+        )
+        jax.debug.callback(
+            lambda l, global_step: writer.add_scalar(
+                "episode/length", float(l), int(global_step)
+            ),
+            l,
+            global_step,
+        )
+
     episode_state = rollover_episode_state(episode_state)
 
     def scan_step(
-        carry: tuple[EpisodeState, Key],
+        carry: tuple[EpisodeState, TrainingState, Key],
         _: None,
-    ) -> tuple[tuple[EpisodeState, Key], EpisodesRollout]:
+    ) -> tuple[tuple[EpisodeState, TrainingState, Key], EpisodesRollout]:
         """Wrapper for env_step to be used in jax.lax.scan."""
-        episode_state, key = carry
+        episode_state, training_state, key = carry
         carry_key, step_key = jr.split(key, 2)
 
-        episode_state, buffer = env_step(
-            env, env_params, agent, episode_state, args, key=step_key
+        episode_state, training_state, buffer, info = env_step(
+            env, env_params, agent, episode_state, training_state, args, key=step_key
         )
 
-        return (episode_state, carry_key), buffer
+        if writer is not None:
+            jax.lax.cond(
+                info["returned_episode"],
+                lambda _: write_episode_stats(info, training_state.global_step),
+                lambda _: None,
+                operand=None,
+            )
 
-    (episode_state, _), rollout = jax.lax.scan(
-        scan_step, (episode_state, key), length=args.num_steps
+        return (episode_state, training_state, carry_key), buffer
+
+    (episode_state, training_state, _), rollout = jax.lax.scan(
+        scan_step, (episode_state, training_state, key), length=args.num_steps
     )
 
     episodes = split_into_episodes(rollout, args)
@@ -774,7 +831,7 @@ def train_on_batch(
 ) -> tuple[CDEAgent, optax.OptState, PPOStats]:
     """Take a training step on a batch of episodes."""
     rollout = jax.tree.map(lambda x: x[batch_indices], rollout)
-    loss, stats, grads = batch_grad(agent, rollout, args)
+    _, stats, grads = batch_grad(agent, rollout, args)
 
     any_nans = jnp.any(
         jnp.asarray(
@@ -865,6 +922,25 @@ def train_on_rollout(
     return agent, opt_state, stats
 
 
+def write_stats(writer: SummaryWriter, stats: PPOStats, training_state: TrainingState):
+    def add_scalar(key, value, global_step, type=float):
+        jax.debug.callback(
+            lambda key, value, type, global_step: writer.add_scalar(
+                key, type(value) if type else value, int(global_step)
+            ),
+            key,
+            value,
+            type,
+            global_step,
+        )
+
+    add_scalar("loss/total", stats.total_loss, training_state.global_step)
+    add_scalar("loss/policy", stats.policy_loss, training_state.global_step)
+    add_scalar("loss/value", stats.value_loss, training_state.global_step)
+    add_scalar("loss/entropy", stats.entropy_loss, training_state.global_step)
+    add_scalar("loss/kl", stats.approx_kl, training_state.global_step)
+
+
 @eqx.filter_jit
 def train(
     env: environment.Environment,
@@ -874,6 +950,9 @@ def train(
     *,
     key: Key,
 ) -> CDEAgent:
+    env = wrappers.LogWrapper(env)
+    writer = SummaryWriter("runs/cde")
+
     agent_dynamic, agent_static = eqx.partition(agent, eqx.is_array)
 
     if args.anneal_learning_rate:
@@ -901,7 +980,14 @@ def train(
         carry_key, rollout_key, training_key = jr.split(key, 3)
 
         episode_state, training_state, rollout = collect_ppo_rollout(
-            env, env_params, agent, episode_state, training_state, args, key=rollout_key
+            env,
+            env_params,
+            agent,
+            episode_state,
+            training_state,
+            args,
+            key=rollout_key,
+            writer=writer,
         )
 
         rollout = compute_gae(rollout, args)
@@ -910,7 +996,7 @@ def train(
             agent, optimizer, opt_state, rollout, args, key=training_key
         )
 
-        jax.debug.print("Stats:\n{}", stats, ordered=True)
+        write_stats(writer, stats, training_state)
 
         agent_dynamic, _ = eqx.partition(agent, eqx.is_array)
 
@@ -955,7 +1041,7 @@ if __name__ == "__main__":
     )
 
     args = PPOArguments(
-        num_steps=1024,
+        num_steps=512,
         gamma=0.93,
         gae_lambda=0.95,
         num_epochs=16,
@@ -967,7 +1053,7 @@ if __name__ == "__main__":
         max_gradient_norm=0.5,
         target_kl=None,
         minibatch_size=64,
-        num_iterations=64,
+        num_iterations=256,
         learning_rate=1e-3,
         anneal_learning_rate=True,
     )
