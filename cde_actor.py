@@ -17,7 +17,7 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from neural_cde import NeuralCDE
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class CDEAgent(eqx.Module):
@@ -247,6 +247,10 @@ class PPOStats:
     value_loss: Float[Array, " *N"]
     entropy_loss: Float[Array, " *N"]
     approx_kl: Float[Array, " *N"]
+    variance: Float[Array, " *N"]
+    explained_variance: Float[Array, " *N"]
+    grad_norm: Float[Array, " *N"]
+    update_norm: Float[Array, " *N"]
 
 
 @chex.dataclass
@@ -419,7 +423,7 @@ def env_step(
             observation
         ),
         times=episode_state.times.at[episode_state.step + 1].set(
-            episode_state.times[episode_state.step] + 1e-1
+            episode_state.times[episode_state.step] + 1e-0
         ),
     )
 
@@ -748,7 +752,8 @@ def empty_episode_loss(
 ) -> tuple[Float[Array, ""], PPOStats]:
     """Return a zero loss and stats for an empty episode."""
     loss = jnp.array(0.0)
-    stats = PPOStats(
+    stats = make_empty(
+        PPOStats,
         total_loss=jnp.nan,
         policy_loss=jnp.nan,
         value_loss=jnp.nan,
@@ -785,6 +790,7 @@ def batch_grad(
                 args=args,
             ),
         )
+
         return carry, (loss, stats, grad)
 
     xs = (
@@ -800,7 +806,7 @@ def batch_grad(
     _, (losses, stats_tree, grads) = jax.lax.scan(scan_fn, None, xs)
     total_loss = jnp.nanmean(losses)
     stats = jax.tree.map(jnp.nanmean, stats_tree)
-    grads = jax.tree.map(jnp.nanmean, grads)
+    grads = jax.tree.map(lambda g: jnp.nanmean(g, axis=0), grads)
 
     return total_loss, stats, grads
 
@@ -842,6 +848,13 @@ def train_on_batch(
 
     updates, opt_state = optimizer.update(grads, opt_state)
     agent = eqx.apply_updates(agent, updates)
+
+    stats.grad_norm = jnp.linalg.norm(
+        jnp.concatenate(jax.tree.flatten(jax.tree.map(jnp.ravel, grads))[0])
+    )
+    stats.update_norm = jnp.linalg.norm(
+        jnp.concatenate(jax.tree.flatten(jax.tree.map(jnp.ravel, updates))[0])
+    )
 
     return agent, opt_state, stats
 
@@ -922,7 +935,13 @@ def train_on_rollout(
     return agent, opt_state, stats
 
 
-def write_stats(writer: SummaryWriter, stats: PPOStats, training_state: TrainingState):
+def write_stats(
+    writer: SummaryWriter,
+    stats: PPOStats,
+    training_state: TrainingState,
+    agent: CDEAgent,
+    i: Int[Array, ""],
+) -> None:
     def add_scalar(key, value, global_step, type=float):
         jax.debug.callback(
             lambda key, value, type, global_step: writer.add_scalar(
@@ -939,6 +958,10 @@ def write_stats(writer: SummaryWriter, stats: PPOStats, training_state: Training
     add_scalar("loss/value", stats.value_loss, training_state.global_step)
     add_scalar("loss/entropy", stats.entropy_loss, training_state.global_step)
     add_scalar("loss/kl", stats.approx_kl, training_state.global_step)
+    add_scalar("loss/grad", stats.grad_norm, training_state.global_step)
+    add_scalar("loss/update", stats.update_norm, training_state.global_step)
+
+    jax.debug.callback(lambda i: logger.info(f"Completed episode {i}"), i, ordered=True)
 
 
 @eqx.filter_jit
@@ -973,7 +996,8 @@ def train(
 
     @eqx.filter_jit
     def scan_step(
-        carry: tuple[TrainingState, EpisodeState, PyTree, optax.OptState, Key], _: None
+        carry: tuple[TrainingState, EpisodeState, PyTree, optax.OptState, Key],
+        i: Int[Array, ""],
     ) -> tuple[tuple[TrainingState, EpisodeState, PyTree, optax.OptState, Key], PyTree]:
         training_state, episode_state, agent_dynamic, opt_state, key = carry
         agent = eqx.combine(agent_dynamic, agent_static)
@@ -996,7 +1020,7 @@ def train(
             agent, optimizer, opt_state, rollout, args, key=training_key
         )
 
-        write_stats(writer, stats, training_state)
+        write_stats(writer, stats, training_state, agent, i)
 
         agent_dynamic, _ = eqx.partition(agent, eqx.is_array)
 
@@ -1018,7 +1042,7 @@ def train(
     (training_state, episode_state, agent_dynamic, opt_state, _), _ = jax.lax.scan(
         scan_step,
         (training_state, episode_state, agent_dynamic, opt_state, training_key),
-        length=args.num_iterations,
+        jnp.arange(args.num_iterations),
     )
 
     agent = eqx.combine(agent_dynamic, agent_static)
@@ -1036,7 +1060,7 @@ if __name__ == "__main__":
         hidden_size=4,
         processed_size=4,
         width_size=128,
-        depth=1,
+        depth=2,
         key=key,
     )
 
@@ -1049,11 +1073,11 @@ if __name__ == "__main__":
         clip_coefficient=0.2,
         clip_value_loss=True,
         entropy_coefficient=0.01,
-        value_coefficient=0.5,
+        value_coefficient=0.8,
         max_gradient_norm=0.5,
         target_kl=None,
-        minibatch_size=64,
-        num_iterations=256,
+        minibatch_size=16,
+        num_iterations=128,
         learning_rate=1e-3,
         anneal_learning_rate=True,
     )
