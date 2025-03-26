@@ -204,14 +204,14 @@ class NeuralCDE(eqx.Module):
         - z1: The final state of the Neural CDE.
         - y1: The output of the Neural CDE.
         """
-        jax.debug.print(
-            "Calling solve\nts: {ts}\nxs: {xs}\nz0: {z0}\nevolving_out: {evolving_out}",
-            ts=ts,
-            xs=xs,
-            z0=z0,
-            evolving_out=evolving_out,
-            ordered=True,
+
+        z0 = eqx.error_if(
+            z0,
+            jnp.any(jnp.isnan(z0)),
+            "Initial state contains NaN",
         )
+        ts = eqx.error_if(ts, jnp.all(jnp.isnan(ts)), "Times are all NaN")
+        xs = eqx.error_if(xs, jnp.all(jnp.isnan(xs)), "Inputs are all NaN")
 
         if self.input_size == "scalar":
             assert xs.ndim == 1
@@ -222,15 +222,49 @@ class NeuralCDE(eqx.Module):
         assert z0.ndim == 1
         assert xs.shape[0] == ts.shape[0]
 
+        # If the input only has one timestep add an extra small timestep
+        t1 = jnp.nanmax(ts)
+        xs = jax.lax.cond(
+            jnp.any(jnp.isnan(xs[1])),
+            lambda: xs.at[1].set(xs[0]),
+            lambda: xs,
+        )
+        ts = jax.lax.cond(
+            jnp.any(jnp.isnan(ts[1])),
+            lambda: ts.at[1].set(ts[0] + 1e-3),
+            lambda: ts,
+        )
+
         # Create a control term with a cubic interpolation of the input
         xs = jnp.concatenate([ts[:, None], xs], axis=1)  # Add time to input
-        coeffs = diffrax.backward_hermite_coefficients(ts, xs)
+        coeffs = diffrax.backward_hermite_coefficients(
+            ts, xs, fill_forward_nans_at_end=True
+        )
         control = diffrax.CubicInterpolation(ts, coeffs)
         term = diffrax.ControlTerm(self.field, control).to_ode()  # pyright: ignore
 
+        initial_field = self.field(ts[0], z0, None)
+        initial_control = control.evaluate(ts[0])
+        initial_derivative = jnp.matmul(initial_field, initial_control)
+
+        initial_field = eqx.error_if(
+            initial_field,
+            jnp.any(jnp.isnan(initial_field)),
+            "Initial field contains NaN",
+        )
+        initial_control = eqx.error_if(
+            initial_control,
+            jnp.any(jnp.isnan(initial_control)),
+            "Initial control contains NaN",
+        )
+        initial_derivative = eqx.error_if(
+            initial_derivative,
+            jnp.any(jnp.isnan(initial_derivative)),
+            "Initial derivative contains NaN",
+        )
+
         solver = diffrax.Tsit5()
         stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-6)
-        t1 = jnp.nanmax(ts)
 
         if evolving_out:
             saveat = diffrax.SaveAt(ts=ts)

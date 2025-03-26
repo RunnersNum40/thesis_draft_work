@@ -108,9 +108,9 @@ class CDEAgent(eqx.Module):
 
     def get_action_and_value(
         self,
-        ts: Float[ArrayLike, " N"],
-        xs: Float[ArrayLike, " N {self.input_size}"],
-        a1: Float[ArrayLike, " {self.action_size}"] | None = None,
+        ts: Float[Array, " N"],
+        xs: Float[Array, " N {self.input_size}"],
+        a1: Float[Array, " {self.action_size}"] | None = None,
         *,
         key: Key | None = None,
         evolving_out: bool = False,
@@ -146,13 +146,6 @@ class CDEAgent(eqx.Module):
         - entropy: Entropy of the action distribution.
         - value: Value of the final state.
         """
-        jax.debug.print(
-            "Getting initial state. t0: {}, x0: {}, z0: {}\n",
-            ts[0],
-            xs[0],
-            self.neural_cde.initial_state(jnp.asarray(ts[0]), jnp.asarray(xs[0])),
-            ordered=True,
-        )
         z0 = self.initial_state(ts[0], xs[0])
         z1, processed, _ = self.neural_cde(
             jnp.asarray(ts), jnp.asarray(xs), z0, evolving_out=evolving_out
@@ -369,8 +362,6 @@ def env_step(
     - episode_state: New episode state.
     - buffer: Buffer of data from the episode step.
     """
-    jax.debug.print("Stepping environment: {}\n", episode_state, ordered=True)
-
     actor_key, env_key, reset_key = jr.split(key, 3)
 
     _, action, log_prob, entropy, value = agent.get_action_and_value(
@@ -403,13 +394,15 @@ def env_step(
     buffer.entropies = entropy
     buffer.values = value
 
-    episode_state.step += 1
-    episode_state.env_state = env_state
-    episode_state.observations = episode_state.observations.at[episode_state.step].set(
-        observation
-    )
-    episode_state.times = episode_state.times.at[episode_state.step].set(
-        episode_state.times[episode_state.step - 1] + 1e-1
+    episode_state = EpisodeState(
+        step=episode_state.step + 1,
+        env_state=env_state,
+        observations=episode_state.observations.at[episode_state.step + 1].set(
+            observation
+        ),
+        times=episode_state.times.at[episode_state.step + 1].set(
+            episode_state.times[episode_state.step] + 1e-1
+        ),
     )
 
     # If the episode is done, reset the environment.
@@ -690,38 +683,40 @@ def episode_loss(
     return total_loss, stats
 
 
-def batch_loss(
-    agent: CDEAgent, rollout: EpisodesRollout, args: PPOArguments
-) -> tuple[Float[Array, " *N"], PPOStats]:
-    """Compute the PPO loss for a batch of episodes.
+episode_grad = eqx.filter_value_and_grad(episode_loss, has_aux=True)
 
-    Uses scan rather than vmap to avoid computing both branches of the cond.
-    """
-    xs = (
-        rollout.times,
-        rollout.observations,
-        rollout.actions,
-        rollout.log_probs,
-        rollout.values,
-        rollout.advantages,
-        rollout.returns,
+
+def empty_episode_loss(
+    agent: CDEAgent,
+) -> tuple[Float[Array, ""], PPOStats]:
+    """Return a zero loss and stats for an empty episode."""
+    loss = jnp.array(0.0)
+    stats = PPOStats(
+        total_loss=jnp.nan,
+        policy_loss=jnp.nan,
+        value_loss=jnp.nan,
+        entropy_loss=jnp.nan,
+        approx_kl=jnp.nan,
     )
+
+    return loss, stats
+
+
+empty_episode_grad = eqx.filter_value_and_grad(empty_episode_loss, has_aux=True)
+
+
+def batch_grad(
+    agent: CDEAgent, rollout: EpisodesRollout, args: PPOArguments
+) -> tuple[Float[Array, " *N"], PPOStats, PyTree]:
+    """Compute the PPO loss and gradient for a batch of episodes."""
 
     def scan_fn(carry, x):
         times, obs, actions, log_probs, values, adv, ret = x
-        loss, stats = jax.lax.cond(
+        # Skip the episode if all times are NaN.
+        (loss, stats), grad = jax.lax.cond(
             jnp.all(jnp.isnan(times)),
-            lambda: (
-                jnp.nan,
-                PPOStats(
-                    total_loss=jnp.nan,
-                    policy_loss=jnp.nan,
-                    value_loss=jnp.nan,
-                    entropy_loss=jnp.nan,
-                    approx_kl=jnp.nan,
-                ),
-            ),
-            lambda: episode_loss(
+            lambda: empty_episode_grad(agent),
+            lambda: episode_grad(
                 agent,
                 times,
                 obs,
@@ -733,17 +728,24 @@ def batch_loss(
                 args=args,
             ),
         )
-        return carry, (loss, stats)
+        return carry, (loss, stats, grad)
 
-    _, (losses, stats_tree) = jax.lax.scan(scan_fn, None, xs)
+    xs = (
+        rollout.times,
+        rollout.observations,
+        rollout.actions,
+        rollout.log_probs,
+        rollout.values,
+        rollout.advantages,
+        rollout.returns,
+    )
+
+    _, (losses, stats_tree, grads) = jax.lax.scan(scan_fn, None, xs)
     total_loss = jnp.nanmean(losses)
     stats = jax.tree.map(jnp.nanmean, stats_tree)
-    total_loss = jnp.where(jnp.isnan(total_loss), 0.0, total_loss)
+    grads = jax.tree.map(jnp.nanmean, grads)
 
-    return total_loss, stats
-
-
-loss_grad = eqx.filter_value_and_grad(batch_loss, has_aux=True)
+    return total_loss, stats, grads
 
 
 def get_batch_indices(
@@ -772,7 +774,15 @@ def train_on_batch(
 ) -> tuple[CDEAgent, optax.OptState, PPOStats]:
     """Take a training step on a batch of episodes."""
     rollout = jax.tree.map(lambda x: x[batch_indices], rollout)
-    (_, stats), grads = loss_grad(agent, rollout, args)
+    loss, stats, grads = batch_grad(agent, rollout, args)
+
+    any_nans = jnp.any(
+        jnp.asarray(
+            jax.tree.flatten(jax.tree.map(lambda l: jnp.any(jnp.isnan(l)), grads))[0]
+        )
+    )
+    grads = eqx.error_if(grads, any_nans, "Gradients contain NaNs.")
+
     updates, opt_state = optimizer.update(grads, opt_state)
     agent = eqx.apply_updates(agent, updates)
 
@@ -948,7 +958,7 @@ if __name__ == "__main__":
         num_steps=1024,
         gamma=0.93,
         gae_lambda=0.95,
-        num_epochs=1,
+        num_epochs=16,
         normalize_advantage=True,
         clip_coefficient=0.2,
         clip_value_loss=True,
@@ -957,7 +967,7 @@ if __name__ == "__main__":
         max_gradient_norm=0.5,
         target_kl=None,
         minibatch_size=64,
-        num_iterations=8,
+        num_iterations=64,
         learning_rate=1e-3,
         anneal_learning_rate=True,
     )
