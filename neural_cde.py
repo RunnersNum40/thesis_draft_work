@@ -102,6 +102,7 @@ class NeuralCDE(eqx.Module):
     output: eqx.nn.MLP
 
     input_size: int | Literal["scalar"]
+    state_size: int
     output_size: int | Literal["scalar"]
 
     def __init__(
@@ -143,6 +144,7 @@ class NeuralCDE(eqx.Module):
         ikey, fkey, okey = jr.split(key, 3)
 
         self.input_size = input_size
+        self.state_size = hidden_size
         self.output_size = output_size
 
         if input_size == "scalar":
@@ -186,7 +188,7 @@ class NeuralCDE(eqx.Module):
         z0: Array,
         *,
         evolving_out: bool = False,
-    ) -> tuple[Array, Array]:
+    ) -> tuple[Array, Array, diffrax.RESULTS]:
         """Compute the output of the Neural CDE.
 
         Evaluates the Neural CDE at a series of times and inputs using cubic
@@ -202,6 +204,15 @@ class NeuralCDE(eqx.Module):
         - z1: The final state of the Neural CDE.
         - y1: The output of the Neural CDE.
         """
+        jax.debug.print(
+            "Calling solve\nts: {ts}\nxs: {xs}\nz0: {z0}\nevolving_out: {evolving_out}",
+            ts=ts,
+            xs=xs,
+            z0=z0,
+            evolving_out=evolving_out,
+            ordered=True,
+        )
+
         if self.input_size == "scalar":
             assert xs.ndim == 1
             xs = jnp.expand_dims(xs, axis=-1)
@@ -211,9 +222,6 @@ class NeuralCDE(eqx.Module):
         assert z0.ndim == 1
         assert xs.shape[0] == ts.shape[0]
 
-        if len(ts) == 1:
-            return z0, self.output(z0)
-
         # Create a control term with a cubic interpolation of the input
         xs = jnp.concatenate([ts[:, None], xs], axis=1)  # Add time to input
         coeffs = diffrax.backward_hermite_coefficients(ts, xs)
@@ -222,13 +230,12 @@ class NeuralCDE(eqx.Module):
 
         solver = diffrax.Tsit5()
         stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-6)
+        t1 = jnp.nanmax(ts)
 
         if evolving_out:
             saveat = diffrax.SaveAt(ts=ts)
         else:
             saveat = diffrax.SaveAt(t1=True)
-
-        t1 = jnp.nanmax(ts)
 
         solution = diffrax.diffeqsolve(
             term,
@@ -241,14 +248,19 @@ class NeuralCDE(eqx.Module):
             saveat=saveat,
         )
 
-        assert solution.ys is not None
-        ys = solution.ys
-
+        result = solution.result
         if evolving_out:
-            ys = jnp.where(jnp.isnan(ts[:, None]), jnp.nan, ys)
-            return ys, jax.vmap(self.output)(ys)
+            zs = solution.ys
+            zs = jnp.asarray(jnp.where(jnp.isnan(ts[:, None]), jnp.nan, zs))
+            return zs, jax.vmap(self.output)(zs), result
         else:
-            return ys[-1], self.output(ys[-1])
+            z1 = solution.ys[-1]
+            z1 = jax.lax.cond(
+                jnp.isnan(t1),
+                lambda: jnp.full(z1.shape, jnp.nan),
+                lambda: z1,
+            )
+            return z1, self.output(z1), result
 
     def initial_state(self, t0: float | Array, x0: Array) -> Array:
         """Return an initial state for the given input and time.
@@ -372,7 +384,7 @@ if __name__ == "__main__":
     ) -> tuple[Array, Array]:
         """Compute the loss of a batch of control inputs and labels"""
         z0_batch = jax.vmap(model.initial_state)(ts_batch[:, 0], xs_batch[:, 0])
-        _, prediction_batch = jax.vmap(model)(ts_batch, xs_batch, z0_batch)
+        _, prediction_batch, _ = jax.vmap(model)(ts_batch, xs_batch, z0_batch)
         error_batch = jax.vmap(jnp.linalg.norm)(prediction_batch - y1_batch)
         return jnp.mean(error_batch), prediction_batch
 

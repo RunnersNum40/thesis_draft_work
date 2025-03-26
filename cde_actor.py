@@ -6,7 +6,6 @@ import chex
 import equinox as eqx
 import gymnax as gym
 import jax
-from numpy import roll
 import optax
 from gymnax.environments import environment
 from jax import numpy as jnp
@@ -132,7 +131,7 @@ class CDEAgent(eqx.Module):
         Returns:
         - value: Value of the final state.
         """
-        _, processed = self.neural_cde(
+        _, processed, _ = self.neural_cde(
             jnp.asarray(ts), jnp.asarray(xs), z0, evolving_out=evolving_out
         )
         if evolving_out:
@@ -182,7 +181,7 @@ class CDEAgent(eqx.Module):
         - entropy: Entropy of the action distribution.
         - value: Value of the final state.
         """
-        z1, processed = self.neural_cde(
+        z1, processed, _ = self.neural_cde(
             jnp.asarray(ts), jnp.asarray(xs), z0, evolving_out=evolving_out
         )
         if evolving_out:
@@ -503,6 +502,7 @@ def collect_ppo_rollout(
     - training_state: New training state.
     - episodes: Rollout of episodes.
     """
+    episode_state.step = jnp.array(0)  # Start from the start of the buffer
 
     def scan_step(
         carry: tuple[EpisodeState, Key],
@@ -515,6 +515,7 @@ def collect_ppo_rollout(
         episode_state, buffer = env_step(
             env, env_params, agent, episode_state, args, key=step_key
         )
+
         return (episode_state, carry_key), buffer
 
     (episode_state, _), rollout = jax.lax.scan(
@@ -705,9 +706,11 @@ def episode_loss(
 def batch_loss(
     agent: CDEAgent, rollout: EpisodesRollout, args: PPOArguments
 ) -> tuple[Float[Array, " *N"], PPOStats]:
-    """Compute the PPO loss for a batch of episodes."""
+    """Compute the PPO loss for a batch of episodes.
 
-    total_loss, stats = jax.vmap(partial(episode_loss, agent, args=args))(
+    Uses scan rather than vmap to avoid computing both branches of the cond.
+    """
+    xs = (
         rollout.times,
         rollout.observations,
         rollout.initial_agent_state,
@@ -718,9 +721,38 @@ def batch_loss(
         rollout.returns,
     )
 
-    total_loss = jnp.nanmean(total_loss)
-    stats = jax.tree_map(jnp.nanmean, stats)
+    def scan_fn(carry, x):
+        times, obs, init_state, actions, log_probs, values, adv, ret = x
+        loss, stats = jax.lax.cond(
+            jnp.all(jnp.isnan(times)),
+            lambda: (
+                jnp.nan,
+                PPOStats(
+                    total_loss=jnp.nan,
+                    policy_loss=jnp.nan,
+                    value_loss=jnp.nan,
+                    entropy_loss=jnp.nan,
+                    approx_kl=jnp.nan,
+                ),
+            ),
+            lambda: episode_loss(
+                agent,
+                times,
+                obs,
+                init_state,
+                actions,
+                log_probs,
+                values,
+                adv,
+                ret,
+                args=args,
+            ),
+        )
+        return carry, (loss, stats)
 
+    _, (losses, stats_tree) = jax.lax.scan(scan_fn, None, xs)
+    total_loss = jnp.nanmean(losses)
+    stats = jax.tree.map(jnp.nanmean, stats_tree)
     total_loss = jnp.where(jnp.isnan(total_loss), 0.0, total_loss)
 
     return total_loss, stats
@@ -792,7 +824,7 @@ def epoch(
         scan_batch, (agent_dynamic, opt_state), indices
     )
 
-    stats = jax.tree_map(jnp.mean, stats)
+    stats = jax.tree.map(jnp.nanmean, stats)
     agent = eqx.combine(agent_dynamic, agent_static)
 
     return agent, opt_state, stats
@@ -811,7 +843,7 @@ def train_on_rollout(
 
     def scan_epoch(
         carry: tuple[PyTree, optax.OptState, Key | None],
-        xs: None,
+        _: None,
     ) -> tuple[tuple[PyTree, optax.OptState, Key | None], PPOStats]:
         agent_dynamic, opt_state, key = carry
         agent = eqx.combine(agent_dynamic, agent_static)
@@ -833,7 +865,7 @@ def train_on_rollout(
         scan_epoch, (agent_dynamic, opt_state, key), length=args.num_epochs
     )
 
-    stats = jax.tree_map(jnp.mean, stats)
+    stats = jax.tree.map(jnp.nanmean, stats)
     agent = eqx.combine(agent_dynamic, agent_static)
 
     return agent, opt_state, stats
@@ -884,6 +916,8 @@ def train(
             agent, optimizer, opt_state, rollout, args, key=training_key
         )
 
+        jax.debug.print("Stats:\n{}", stats, ordered=True)
+
         agent_dynamic, _ = eqx.partition(agent, eqx.is_array)
 
         return (
@@ -919,18 +953,18 @@ if __name__ == "__main__":
     agent = CDEAgent(
         env=env,
         env_params=env_params,
-        hidden_size=4,
-        processed_size=16,
-        width_size=64,
+        hidden_size=2,
+        processed_size=2,
+        width_size=128,
         depth=2,
         key=key,
     )
 
     args = PPOArguments(
-        num_steps=1024,
+        num_steps=512,
         gamma=0.93,
         gae_lambda=0.95,
-        num_epochs=16,
+        num_epochs=1,
         normalize_advantage=True,
         clip_coefficient=0.2,
         clip_value_loss=True,
@@ -939,7 +973,7 @@ if __name__ == "__main__":
         max_gradient_norm=0.5,
         target_kl=None,
         minibatch_size=64,
-        num_iterations=128,
+        num_iterations=8,
         learning_rate=1e-3,
         anneal_learning_rate=True,
     )
