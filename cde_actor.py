@@ -106,44 +106,10 @@ class CDEAgent(eqx.Module):
             key=critic_key,
         )
 
-    def get_value(
-        self,
-        ts: Float[ArrayLike, " N"],
-        xs: Float[ArrayLike, " N {self.input_size}"],
-        z0: Float[Array, " {self.state_size}"],
-        *,
-        key: Key | None = None,
-        evolving_out: bool = False,
-    ) -> Float[Array, " *N"]:
-        """Return the value of the given inputs.
-
-        A set of times and inputs padded with NaNs is provided to allow for
-        JIT compilation since the number of steps is not known at compile time.
-        Pass the maximum index of the inputs to act on as `max_index`.
-
-        Arguments:
-        - ts: Time steps of the inputs.
-        - xs: Inputs to the actor-critic model.
-        - z0: Initial state of the actor-critic model.
-        - key: Key for sampling the action.
-        - evolving_out: Whether to compute the output for every time step.
-
-        Returns:
-        - value: Value of the final state.
-        """
-        _, processed, _ = self.neural_cde(
-            jnp.asarray(ts), jnp.asarray(xs), z0, evolving_out=evolving_out
-        )
-        if evolving_out:
-            return jax.vmap(self.critic)(processed)
-        else:
-            return self.critic(processed)
-
     def get_action_and_value(
         self,
         ts: Float[ArrayLike, " N"],
         xs: Float[ArrayLike, " N {self.input_size}"],
-        z0: Float[Array, " {self.state_size}"],
         a1: Float[ArrayLike, " {self.action_size}"] | None = None,
         *,
         key: Key | None = None,
@@ -169,7 +135,6 @@ class CDEAgent(eqx.Module):
         Arguments:
         - ts: Time steps of the inputs.
         - xs: Inputs to the actor-critic model.
-        - z0: Initial state of the actor-critic model.
         - a1: Optional fixed action.
         - key: Key for sampling the action.
         - evolving_out: Whether to compute the output for every time step.
@@ -181,6 +146,14 @@ class CDEAgent(eqx.Module):
         - entropy: Entropy of the action distribution.
         - value: Value of the final state.
         """
+        jax.debug.print(
+            "Getting initial state. t0: {}, x0: {}, z0: {}\n",
+            ts[0],
+            xs[0],
+            self.neural_cde.initial_state(jnp.asarray(ts[0]), jnp.asarray(xs[0])),
+            ordered=True,
+        )
+        z0 = self.initial_state(ts[0], xs[0])
         z1, processed, _ = self.neural_cde(
             jnp.asarray(ts), jnp.asarray(xs), z0, evolving_out=evolving_out
         )
@@ -238,7 +211,6 @@ class EpisodeState:
     env_state: gym.EnvState
     observations: Float[Array, " num_steps observation_size"]
     times: Float[Array, " num_steps"]
-    initial_agent_state: Float[Array, " state_size"]
 
 
 @chex.dataclass
@@ -264,9 +236,6 @@ class EpisodesRollout:
     advantages: Float[Array, " *N num_steps"]
     returns: Float[Array, " *N num_steps"]
     times: Float[Array, " *N num_steps"]
-    initial_agent_state: Float[
-        Array, " *N num_steps state_size"
-    ]  # Stores duplicates for easier computation
 
 
 @chex.dataclass
@@ -318,12 +287,13 @@ def make_empty(cls, **kwargs):
 def reset(
     env: environment.Environment,
     env_params: gym.EnvParams,
-    agent: CDEAgent,
     args: PPOArguments,
     *,
     key: Key,
 ) -> EpisodeState:
     """Reset the environment and agent to a fresh state.
+
+    Initializes the time to a random value between 0 and 1.
 
     Arguments:
     - env: Environment to reset.
@@ -335,24 +305,44 @@ def reset(
     Returns:
     - training_state: A fresh training state.
     """
-    env_key, agent_key = jr.split(key, 2)
-
-    observation, env_state = env.reset(env_key, env_params)
+    reset_key, time_key = jr.split(key, 2)
+    observation, env_state = env.reset(reset_key, env_params)
     observations = jnp.full(
         (args.num_steps, observation.shape[0]), jnp.nan, dtype=observation.dtype
     )
     observations = observations.at[0].set(observation)
 
     agent_times = jnp.full((args.num_steps,), jnp.nan, dtype=jnp.array(0.0).dtype)
-    agent_times = agent_times.at[0].set(jnp.array(0.0))
-    agent_state = agent.initial_state(agent_times[0], observations[0], key=agent_key)
+    agent_times = agent_times.at[0].set(
+        jr.uniform(time_key, (), minval=0.0, maxval=1.0)
+    )
 
     return EpisodeState(
         step=jnp.array(0),  # Start at 1 to account for the initial state.
         env_state=env_state,
         observations=observations,
         times=agent_times,
-        initial_agent_state=agent_state,
+    )
+
+
+def rollover_episode_state(episode_state: EpisodeState) -> EpisodeState:
+    """If an episode has already filled a buffer, rollover the episode state without resetting the environment."""
+    new_step = jnp.array(0)
+    new_times = (
+        jnp.full_like(episode_state.times, jnp.nan)
+        .at[0]
+        .set(episode_state.times[episode_state.step])
+    )
+    new_observations = (
+        jnp.full_like(episode_state.observations, jnp.nan)
+        .at[0]
+        .set(episode_state.observations[episode_state.step])
+    )
+    return EpisodeState(
+        step=new_step,
+        env_state=episode_state.env_state,
+        observations=new_observations,
+        times=new_times,
     )
 
 
@@ -379,12 +369,13 @@ def env_step(
     - episode_state: New episode state.
     - buffer: Buffer of data from the episode step.
     """
+    jax.debug.print("Stepping environment: {}\n", episode_state, ordered=True)
+
     actor_key, env_key, reset_key = jr.split(key, 3)
 
     _, action, log_prob, entropy, value = agent.get_action_and_value(
         episode_state.times,
         episode_state.observations,
-        episode_state.initial_agent_state,
         key=actor_key,
     )
 
@@ -393,7 +384,6 @@ def env_step(
         observations=episode_state.observations[episode_state.step],
         actions=action,
         times=episode_state.times[episode_state.step],
-        initial_agent_state=episode_state.initial_agent_state,
     )
 
     clipped_action = jnp.clip(
@@ -419,12 +409,13 @@ def env_step(
         observation
     )
     episode_state.times = episode_state.times.at[episode_state.step].set(
-        episode_state.times[episode_state.step - 1] + 1e-3
+        episode_state.times[episode_state.step - 1] + 1e-1
     )
 
+    # If the episode is done, reset the environment.
     episode_state = jax.lax.cond(
         termination | truncation,
-        lambda: reset(env, env_params, agent, args, key=reset_key),
+        lambda: reset(env, env_params, args, key=reset_key),
         lambda: episode_state,
     )
 
@@ -502,7 +493,7 @@ def collect_ppo_rollout(
     - training_state: New training state.
     - episodes: Rollout of episodes.
     """
-    episode_state.step = jnp.array(0)  # Start from the start of the buffer
+    episode_state = rollover_episode_state(episode_state)
 
     def scan_step(
         carry: tuple[EpisodeState, Key],
@@ -607,7 +598,6 @@ def compute_gae(episodes: EpisodesRollout, args: PPOArguments) -> EpisodesRollou
         advantages=advantages,
         returns=returns,
         times=episodes.times,
-        initial_agent_state=episodes.initial_agent_state,
     )
 
 
@@ -615,7 +605,6 @@ def episode_loss(
     agent: CDEAgent,
     times: Float[Array, " N"],
     observations: Float[Array, " N observation_size"],
-    initial_agent_state: Float[Array, " N state_size"],
     actions: Float[Array, " N action_size"],
     log_probs: Float[Array, " N"],
     values: Float[Array, " N"],
@@ -632,8 +621,6 @@ def episode_loss(
     - agent: Agent to compute the loss for.
     - times: Time steps of the episode.
     - observations: Observations of the episode.
-    - initial_agent_state: Initial state of the agent.
-      Should be the same for all steps in the episode.
     - actions: Actions taken in the episode.
     - log_probs: Log probabilities of the actions.
     - values: Values of the states.
@@ -646,7 +633,7 @@ def episode_loss(
     - stats: PPO stats for the episode.
     """
     _, _, new_log_probs, new_entropies, new_values = agent.get_action_and_value(
-        times, observations, initial_agent_state[0], actions, evolving_out=True
+        times, observations, actions, evolving_out=True
     )
 
     log_ratio = new_log_probs - log_probs
@@ -713,7 +700,6 @@ def batch_loss(
     xs = (
         rollout.times,
         rollout.observations,
-        rollout.initial_agent_state,
         rollout.actions,
         rollout.log_probs,
         rollout.values,
@@ -722,7 +708,7 @@ def batch_loss(
     )
 
     def scan_fn(carry, x):
-        times, obs, init_state, actions, log_probs, values, adv, ret = x
+        times, obs, actions, log_probs, values, adv, ret = x
         loss, stats = jax.lax.cond(
             jnp.all(jnp.isnan(times)),
             lambda: (
@@ -739,7 +725,6 @@ def batch_loss(
                 agent,
                 times,
                 obs,
-                init_state,
                 actions,
                 log_probs,
                 values,
@@ -788,7 +773,6 @@ def train_on_batch(
     """Take a training step on a batch of episodes."""
     rollout = jax.tree.map(lambda x: x[batch_indices], rollout)
     (_, stats), grads = loss_grad(agent, rollout, args)
-
     updates, opt_state = optimizer.update(grads, opt_state)
     agent = eqx.apply_updates(agent, updates)
 
@@ -933,7 +917,7 @@ def train(
     training_state = make_empty(
         TrainingState, global_step=jnp.array(0), opt_state=opt_state
     )
-    episode_state = reset(env, env_params, agent, args, key=reset_key)
+    episode_state = reset(env, env_params, args, key=reset_key)
 
     (training_state, episode_state, agent_dynamic, opt_state, _), _ = jax.lax.scan(
         scan_step,
@@ -953,15 +937,15 @@ if __name__ == "__main__":
     agent = CDEAgent(
         env=env,
         env_params=env_params,
-        hidden_size=2,
-        processed_size=2,
+        hidden_size=4,
+        processed_size=4,
         width_size=128,
-        depth=2,
+        depth=1,
         key=key,
     )
 
     args = PPOArguments(
-        num_steps=512,
+        num_steps=1024,
         gamma=0.93,
         gae_lambda=0.95,
         num_epochs=1,
