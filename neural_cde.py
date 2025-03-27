@@ -242,9 +242,7 @@ class NeuralCDE(eqx.Module):
 
         # Create a control term with a cubic interpolation of the input
         xs = jnp.concatenate([ts[:, None], xs], axis=1)  # Add time to input
-        coeffs = diffrax.backward_hermite_coefficients(
-            ts, xs, fill_forward_nans_at_end=True
-        )
+        coeffs = diffrax.backward_hermite_coefficients(ts, xs)
         control = diffrax.CubicInterpolation(ts, coeffs)
         term = diffrax.ControlTerm(self.field, control).to_ode()  # pyright: ignore
 
@@ -294,11 +292,6 @@ class NeuralCDE(eqx.Module):
             return zs, jax.vmap(self.output)(zs), result
         else:
             z1 = solution.ys[-1]
-            z1 = jax.lax.cond(
-                jnp.isnan(t1),
-                lambda: jnp.full(z1.shape, jnp.nan),
-                lambda: z1,
-            )
             return z1, self.output(z1), result
 
     def initial_state(self, t0: float | Array, x0: Array) -> Array:
@@ -513,7 +506,7 @@ if __name__ == "__main__":
     plt.ylabel("Loss")
     plt.show()
 
-    _, prediction = neural_cde(
+    _, prediction, _ = neural_cde(
         ts_test[0],
         xs_test[0],
         neural_cde.initial_state(ts_test[0][0], xs_test[0][0]),

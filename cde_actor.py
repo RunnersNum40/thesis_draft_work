@@ -623,12 +623,12 @@ def compute_gae_episode(
     return returns, advantages
 
 
-def compute_gae(episodes: EpisodesRollout, args: PPOArguments) -> EpisodesRollout:
+def compute_gae(rollout: EpisodesRollout, args: PPOArguments) -> EpisodesRollout:
     """
     Compute GAE advantages and bootstrapped returns for an EpisodesRollout.
 
     Args:
-    - episodes: An EpisodesRollout with fields rewards, values, terminations, truncations.
+    - rollout: An EpisodesRollout with fields rewards, values, terminations, truncations.
         Note that `values` is shape [num_episodes, num_steps] (one value per step).
     - args: PPOArguments with gamma and gae_lambda.
 
@@ -637,21 +637,21 @@ def compute_gae(episodes: EpisodesRollout, args: PPOArguments) -> EpisodesRollou
     """
 
     returns, advantages = jax.vmap(partial(compute_gae_episode, args=args))(
-        episodes.rewards, episodes.values, episodes.terminations, episodes.truncations
+        rollout.rewards, rollout.values, rollout.terminations, rollout.truncations
     )
 
     return EpisodesRollout(
-        observations=episodes.observations,
-        actions=episodes.actions,
-        log_probs=episodes.log_probs,
-        entropies=episodes.entropies,
-        values=episodes.values,
-        rewards=episodes.rewards,
-        terminations=episodes.terminations,
-        truncations=episodes.truncations,
+        observations=rollout.observations,
+        actions=rollout.actions,
+        log_probs=rollout.log_probs,
+        entropies=rollout.entropies,
+        values=rollout.values,
+        rewards=rollout.rewards,
+        terminations=rollout.terminations,
+        truncations=rollout.truncations,
         advantages=advantages,
         returns=returns,
-        times=episodes.times,
+        times=rollout.times,
     )
 
 
@@ -726,7 +726,7 @@ def episode_loss(
         value_loss = jnp.nanmean(jnp.square(new_values - returns)) / 2.0
 
     entropy_loss = jnp.nanmean(new_entropies)
-    total_loss = (
+    loss = (
         policy_loss
         + args.value_coefficient * value_loss
         - args.entropy_coefficient * entropy_loss
@@ -734,73 +734,20 @@ def episode_loss(
 
     stats = make_empty(
         PPOStats,
-        total_loss=total_loss,
+        total_loss=loss,
         policy_loss=policy_loss,
         value_loss=value_loss,
         entropy_loss=entropy_loss,
         approx_kl=approx_kl,
     )
 
-    return total_loss, stats
-
-
-episode_grad = eqx.filter_value_and_grad(episode_loss, has_aux=True)
-
-
-def empty_episode_loss(
-    agent: CDEAgent,
-) -> tuple[Float[Array, ""], PPOStats]:
-    """Return a zero loss and stats for an empty episode."""
-    loss = jnp.nan
-    stats = make_empty(
-        PPOStats,
-        total_loss=jnp.nan,
-        policy_loss=jnp.nan,
-        value_loss=jnp.nan,
-        entropy_loss=jnp.nan,
-        approx_kl=jnp.nan,
-    )
-
     return loss, stats
 
 
-empty_episode_grad = eqx.filter_value_and_grad(empty_episode_loss, has_aux=True)
-
-
-def batch_grad(
+def batch_loss(
     agent: CDEAgent, rollout: EpisodesRollout, args: PPOArguments
-) -> tuple[Float[Array, " *N"], PPOStats, PyTree]:
-    """Compute the PPO loss and gradient for a batch of episodes."""
-
-    def scan_fn(carry, x):
-        times, obs, actions, log_probs, values, adv, ret = x
-        # Skip the episode if all times are NaN.
-        (loss, stats), grad = jax.lax.cond(
-            jnp.all(jnp.isnan(times)),
-            lambda: empty_episode_grad(agent),
-            lambda: episode_grad(
-                agent,
-                times,
-                obs,
-                actions,
-                log_probs,
-                values,
-                adv,
-                ret,
-                args=args,
-            ),
-        )
-
-        contains_inf = jnp.any(
-            jnp.asarray(
-                jax.tree.flatten(jax.tree.map(lambda x: jnp.any(jnp.isinf(x)), grad))[0]
-            )
-        )
-        grad = eqx.error_if(grad, contains_inf, "Gradient contains inf.")
-
-        return carry, (loss, stats, grad)
-
-    xs = (
+) -> tuple[Float[Array, ""], PPOStats]:
+    losses, stats_tree = jax.vmap(partial(episode_loss, agent, args=args))(
         rollout.times,
         rollout.observations,
         rollout.actions,
@@ -810,28 +757,22 @@ def batch_grad(
         rollout.returns,
     )
 
-    _, (losses, stats_tree, grads) = jax.lax.scan(scan_fn, None, xs)
-    total_loss = jnp.nanmean(losses)
-    stats = jax.tree.map(jnp.nanmean, stats_tree)
-    grads = jax.tree.map(lambda g: jnp.nan_to_num(jnp.nanmean(g, axis=0)), grads)
+    loss = jnp.sum(losses)
+    stats = jax.tree.map(jnp.mean, stats_tree)
 
-    return total_loss, stats, grads
+    return loss, stats
+
+
+batch_grad = eqx.filter_value_and_grad(batch_loss, has_aux=True)
 
 
 def get_batch_indices(
-    batch_size: int, dataset_size: int, *, key: Key | None = None
+    rollout: EpisodesRollout, args: PPOArguments, *, key: Key
 ) -> Int[Array, " {dataset_size // batch_size} {batch_size}"]:
-    """Get batch indices for a dataset of a given size."""
-    indices = jnp.arange(dataset_size)
-
-    if key is not None:
-        indices = jax.random.permutation(key, indices)
-
-    if dataset_size % batch_size != 0:
-        logger.warning("Dataset size is not divisible by batch size.")
-
-    indices = indices[: dataset_size - (dataset_size % batch_size)]
-    return indices.reshape(-1, batch_size)
+    """Get batch indices of only valid episodes."""
+    num_episodes = jnp.sum(~jnp.isnan(rollout.times[:, 0]))
+    indices = jr.permutation(key, rollout.times.shape[0]) % num_episodes
+    return indices.reshape(-1, args.minibatch_size)
 
 
 def train_on_batch(
@@ -844,23 +785,22 @@ def train_on_batch(
 ) -> tuple[CDEAgent, optax.OptState, PPOStats]:
     """Take a training step on a batch of episodes."""
     rollout = jax.tree.map(lambda x: x[batch_indices], rollout)
-    _, stats, grads = batch_grad(agent, rollout, args)
+    (loss, stats), grad = batch_grad(agent, rollout, args)
 
-    updates, opt_state = optimizer.update(grads, opt_state)
+    flat_grad = jnp.concatenate(jax.tree.flatten(jax.tree.map(jnp.ravel, grad))[0])
+
+    grad = eqx.error_if(grad, jnp.isnan(flat_grad).any(), "Gradient is NaN.")
+    grad = eqx.error_if(grad, jnp.isinf(flat_grad).any(), "Gradient is inf.")
+
+    updates, opt_state = optimizer.update(grad, opt_state)
     agent = eqx.apply_updates(agent, updates)
 
     stats.grad_norm = jnp.linalg.norm(
-        jnp.concatenate(jax.tree.flatten(jax.tree.map(jnp.ravel, grads))[0])
+        jnp.concatenate(jax.tree.flatten(jax.tree.map(jnp.ravel, grad))[0])
     )
     stats.update_norm = jnp.linalg.norm(
         jnp.concatenate(jax.tree.flatten(jax.tree.map(jnp.ravel, updates))[0])
     )
-
-    stats = eqx.error_if(stats, jnp.isnan(stats.grad_norm), "Gradient norm is NaN.")
-    stats = eqx.error_if(stats, jnp.isnan(stats.update_norm), "Update norm is NaN.")
-
-    stats = eqx.error_if(stats, jnp.isinf(stats.grad_norm), "Gradient norm is inf.")
-    stats = eqx.error_if(stats, jnp.isinf(stats.update_norm), "Update norm is inf.")
 
     return agent, opt_state, stats
 
@@ -887,14 +827,12 @@ def epoch(
         agent_dynamic, _ = eqx.partition(agent, eqx.is_array)
         return (agent_dynamic, opt_state), stats
 
-    indices = get_batch_indices(
-        args.minibatch_size, rollout.observations.shape[0], key=key
-    )
+    indices = get_batch_indices(rollout, args, key=key)
     (agent_dynamic, opt_state), stats = jax.lax.scan(
         scan_batch, (agent_dynamic, opt_state), indices
     )
 
-    stats = jax.tree.map(jnp.nanmean, stats)
+    stats = jax.tree.map(jnp.mean, stats)
     agent = eqx.combine(agent_dynamic, agent_static)
 
     return agent, opt_state, stats
@@ -1086,10 +1024,10 @@ if __name__ == "__main__":
     )
 
     args = PPOArguments(
-        num_steps=512,
+        num_steps=32,
         gamma=0.93,
         gae_lambda=0.95,
-        num_epochs=16,
+        num_epochs=1,
         normalize_advantage=True,
         clip_coefficient=0.2,
         clip_value_loss=True,
@@ -1097,7 +1035,7 @@ if __name__ == "__main__":
         value_coefficient=0.8,
         max_gradient_norm=0.5,
         target_kl=None,
-        minibatch_size=16,
+        minibatch_size=32,
         num_iterations=128,
         learning_rate=1e-3,
         anneal_learning_rate=True,
