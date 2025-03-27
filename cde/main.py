@@ -107,7 +107,6 @@ class Field(eqx.Module):
             **kwargs,
         )
 
-        # Make the weights smaller to prevent blowing up
         self.tensor_mlp = eqx.tree_at(
             lambda tree: [linear.weight for linear in tree.mlp.layers],
             self.tensor_mlp,
@@ -552,7 +551,7 @@ class PPOArguments:
     num_batches: int
     batch_size: int
 
-    agent_timestep: float = 1e-2
+    agent_timestep: float = 1e-1
 
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -1317,11 +1316,17 @@ if __name__ == "__main__":
     agent = CDEAgent(
         env=env,
         env_params=env_params,
-        hidden_size=4,
-        processed_size=4,
-        width_size=128,
+        hidden_size=2,
+        processed_size=2,
+        width_size=16,
         depth=1,
         key=key,
+        actor_width_size=8,
+        actor_depth=0,
+        output_width_size=8,
+        output_depth=0,
+        critic_width_size=8,
+        critic_depth=1,
     )
 
     args = PPOArguments(
