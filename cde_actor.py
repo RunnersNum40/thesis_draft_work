@@ -785,7 +785,7 @@ def train_on_batch(
 ) -> tuple[CDEAgent, optax.OptState, PPOStats]:
     """Take a training step on a batch of episodes."""
     rollout = jax.tree.map(lambda x: x[batch_indices], rollout)
-    (loss, stats), grad = batch_grad(agent, rollout, args)
+    (_, stats), grad = batch_grad(agent, rollout, args)
 
     flat_grad = jnp.concatenate(jax.tree.flatten(jax.tree.map(jnp.ravel, grad))[0])
 
@@ -953,7 +953,6 @@ def train(
         ("clipping", optax.clip_by_global_norm(args.max_gradient_norm)), ("adam", adam)
     )
 
-    @eqx.filter_jit
     def scan_step(
         carry: tuple[TrainingState, EpisodeState, PyTree, optax.OptState, Key],
         i: Int[Array, ""],
