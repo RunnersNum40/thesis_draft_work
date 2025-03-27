@@ -95,6 +95,7 @@ class Field(eqx.Module):
         out_shape: tuple[int, ...] | Literal["scalar"],
         *,
         key: Array,
+        weight_scale: float = 1.0,
         **kwargs,
     ) -> None:
         self.tensor_mlp = TensorMLP(
@@ -106,12 +107,12 @@ class Field(eqx.Module):
             **kwargs,
         )
 
-        # # Make the weights smaller to prevent blowing up
-        # self.tensor_mlp = eqx.tree_at(
-        #     lambda tree: [linear.weight for linear in tree.mlp.layers],
-        #     self.tensor_mlp,
-        #     replace_fn=lambda x: x / 10.0,
-        # )
+        # Make the weights smaller to prevent blowing up
+        self.tensor_mlp = eqx.tree_at(
+            lambda tree: [linear.weight for linear in tree.mlp.layers],
+            self.tensor_mlp,
+            replace_fn=lambda x: x * weight_scale,
+        )
 
     def __call__(self, t: Array, x: Array, args) -> Array:
         return self.tensor_mlp(x)
@@ -171,12 +172,12 @@ class NeuralCDE(eqx.Module):
         if input_size == "scalar":
             input_size = 1
 
-        # Defualt to a linear initial condition
+        # Default to a linear initial condition
         self.initial = eqx.nn.MLP(
             in_size=input_size + 1,
             out_size=hidden_size,
             width_size=initial_width_size or width_size,
-            depth=initial_depth or 0,
+            depth=initial_depth if initial_depth is not None else 0,
             key=ikey,
         )
 
@@ -196,8 +197,10 @@ class NeuralCDE(eqx.Module):
         self.output = eqx.nn.MLP(
             in_size=hidden_size,
             out_size=output_size,
-            width_size=output_width_size or width_size,
-            depth=output_depth or 0,
+            width_size=(
+                output_width_size if output_width_size is not None else width_size
+            ),
+            depth=output_depth if output_depth is not None else depth,
             key=okey,
         )
 
@@ -385,8 +388,8 @@ class CDEAgent(eqx.Module):
         self.actor = eqx.nn.MLP(
             in_size=processed_size,
             out_size=self.action_size,
-            width_size=actor_width_size or width_size,
-            depth=actor_depth or depth,
+            width_size=actor_width_size if actor_width_size is not None else width_size,
+            depth=actor_depth if actor_depth is not None else depth,
             key=actor_key,
         )
 
@@ -395,8 +398,10 @@ class CDEAgent(eqx.Module):
         self.critic = eqx.nn.MLP(
             in_size=processed_size,
             out_size="scalar",
-            width_size=critic_width_size or width_size,
-            depth=critic_depth or depth,
+            width_size=(
+                critic_width_size if critic_width_size is not None else width_size
+            ),
+            depth=critic_depth if critic_depth is not None else depth,
             key=critic_key,
         )
 
@@ -537,6 +542,8 @@ class PPOStats:
 
 @chex.dataclass
 class PPOArguments:
+    run_name: str
+
     num_iterations: int
     num_steps: int
     num_epochs: int
@@ -544,6 +551,8 @@ class PPOArguments:
     minibatch_size: int
     num_batches: int
     batch_size: int
+
+    agent_timestep: float = 1e-2
 
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -710,7 +719,7 @@ def env_step(
             observation
         ),
         times=episode_state.times.at[episode_state.step + 1].set(
-            episode_state.times[episode_state.step] + 1e-0
+            episode_state.times[episode_state.step] + args.agent_timestep
         ),
     )
 
@@ -797,11 +806,11 @@ def calculate_gae(
     terminations: Bool[Array, " num_steps"],
     args: PPOArguments,
 ) -> tuple[Float[Array, " num_steps"], Float[Array, " num_steps"]]:
-    def scan_fn(carry, t):
+    def scan_fn(carry: Float, t: Int) -> tuple[Float, Float]:
         gae = carry
         reward = rewards[t]
         value = values[t]
-        next_value = jax.lax.select(t < args.num_steps - 1, values[t + 1], value)
+        next_value = jnp.where(t < args.num_steps - 1, values[t + 1], value)
         not_done = 1.0 - terminations[t].astype(jnp.float32)
 
         delta = reward + args.gamma * next_value * not_done - value
@@ -837,7 +846,9 @@ def calculate_loss(
     approx_kl = jnp.mean(ratio - log_ratio) - 1
 
     if args.normalize_advantage:
-        advantages = (advantages - jnp.mean(advantages)) / (jnp.std(advantages) + 1e-8)
+        advantages = (advantages - jnp.mean(advantages)) / (
+            jnp.std(advantages) + jnp.finfo(advantages.dtype).eps
+        )
 
     policy_loss = -jnp.mean(
         jnp.minimum(
@@ -1019,7 +1030,7 @@ def epoch(
     return agent, opt_state, stats
 
 
-def batch_rollout(rollout: RolloutBuffer, args: PPOArguments, key: Key) -> tuple[
+def minibatch_rollout(rollout: RolloutBuffer, args: PPOArguments, key: Key) -> tuple[
     Float[Array, "num_minibatches minibatch_size"],
     Float[Array, "num_minibatches minibatch_size observation_size"],
     Float[Array, "num_minibatches minibatch_size action_size"],
@@ -1118,7 +1129,7 @@ def train_on_rollout(
         values,
         advantages,
         returns,
-    ) = batch_rollout(rollout, args, batching_key)
+    ) = minibatch_rollout(rollout, args, batching_key)
 
     def scan_epoch(
         carry: tuple[PyTree, optax.OptState, Key],
@@ -1217,7 +1228,6 @@ def write_training_stats(
     add_scalar(writer, "norm/update", stats.update_norm, global_step)
 
 
-@eqx.filter_jit
 def train(
     env: environment.Environment,
     env_params: gym.EnvParams,
@@ -1226,7 +1236,8 @@ def train(
     key: Key,
 ) -> CDEAgent:
     env = wrappers.LogWrapper(env)
-    writer = SummaryWriter("runs/baseline")
+    writer = SummaryWriter(f"runs/{args.run_name}")
+    writer.add_hparams(vars(args), {})
 
     agent_dynamic, agent_static = eqx.partition(agent, eqx.is_array)
 
@@ -1314,6 +1325,7 @@ if __name__ == "__main__":
     )
 
     args = PPOArguments(
+        run_name="cde",
         num_iterations=512,
         num_steps=1024,
         num_epochs=16,
