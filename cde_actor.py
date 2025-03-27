@@ -17,7 +17,7 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from neural_cde import NeuralCDE
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 
 class CDEAgent(eqx.Module):
@@ -751,7 +751,7 @@ def empty_episode_loss(
     agent: CDEAgent,
 ) -> tuple[Float[Array, ""], PPOStats]:
     """Return a zero loss and stats for an empty episode."""
-    loss = jnp.array(0.0)
+    loss = jnp.nan
     stats = make_empty(
         PPOStats,
         total_loss=jnp.nan,
@@ -791,6 +791,13 @@ def batch_grad(
             ),
         )
 
+        contains_inf = jnp.any(
+            jnp.asarray(
+                jax.tree.flatten(jax.tree.map(lambda x: jnp.any(jnp.isinf(x)), grad))[0]
+            )
+        )
+        grad = eqx.error_if(grad, contains_inf, "Gradient contains inf.")
+
         return carry, (loss, stats, grad)
 
     xs = (
@@ -806,7 +813,7 @@ def batch_grad(
     _, (losses, stats_tree, grads) = jax.lax.scan(scan_fn, None, xs)
     total_loss = jnp.nanmean(losses)
     stats = jax.tree.map(jnp.nanmean, stats_tree)
-    grads = jax.tree.map(lambda g: jnp.nanmean(g, axis=0), grads)
+    grads = jax.tree.map(lambda g: jnp.nan_to_num(jnp.nanmean(g, axis=0)), grads)
 
     return total_loss, stats, grads
 
@@ -839,13 +846,6 @@ def train_on_batch(
     rollout = jax.tree.map(lambda x: x[batch_indices], rollout)
     _, stats, grads = batch_grad(agent, rollout, args)
 
-    any_nans = jnp.any(
-        jnp.asarray(
-            jax.tree.flatten(jax.tree.map(lambda l: jnp.any(jnp.isnan(l)), grads))[0]
-        )
-    )
-    grads = eqx.error_if(grads, any_nans, "Gradients contain NaNs.")
-
     updates, opt_state = optimizer.update(grads, opt_state)
     agent = eqx.apply_updates(agent, updates)
 
@@ -855,6 +855,12 @@ def train_on_batch(
     stats.update_norm = jnp.linalg.norm(
         jnp.concatenate(jax.tree.flatten(jax.tree.map(jnp.ravel, updates))[0])
     )
+
+    stats = eqx.error_if(stats, jnp.isnan(stats.grad_norm), "Gradient norm is NaN.")
+    stats = eqx.error_if(stats, jnp.isnan(stats.update_norm), "Update norm is NaN.")
+
+    stats = eqx.error_if(stats, jnp.isinf(stats.grad_norm), "Gradient norm is inf.")
+    stats = eqx.error_if(stats, jnp.isinf(stats.update_norm), "Update norm is inf.")
 
     return agent, opt_state, stats
 
@@ -961,7 +967,22 @@ def write_stats(
     add_scalar("loss/grad", stats.grad_norm, training_state.global_step)
     add_scalar("loss/update", stats.update_norm, training_state.global_step)
 
-    jax.debug.callback(lambda i: logger.info(f"Completed episode {i}"), i, ordered=True)
+    jax.debug.callback(lambda loss: logger.debug(f"Loss: {loss}"), stats.total_loss)
+    jax.debug.callback(
+        lambda policy: logger.debug(f"Policy: {policy}"), stats.policy_loss
+    )
+    jax.debug.callback(lambda value: logger.debug(f"Value: {value}"), stats.value_loss)
+    jax.debug.callback(
+        lambda entropy: logger.debug(f"Entropy: {entropy}"), stats.entropy_loss
+    )
+    jax.debug.callback(lambda kl: logger.debug(f"KL: {kl}"), stats.approx_kl)
+    jax.debug.callback(lambda grad: logger.debug(f"Grad: {grad}"), stats.grad_norm)
+    jax.debug.callback(
+        lambda update: logger.debug(f"Update: {update}"), stats.update_norm
+    )
+    jax.debug.callback(
+        lambda i: logger.info(f"Completed iteration {i}"), i, ordered=True
+    )
 
 
 @eqx.filter_jit
@@ -974,7 +995,7 @@ def train(
     key: Key,
 ) -> CDEAgent:
     env = wrappers.LogWrapper(env)
-    writer = SummaryWriter("runs/cde")
+    writer = SummaryWriter("runs/cde2")
 
     agent_dynamic, agent_static = eqx.partition(agent, eqx.is_array)
 

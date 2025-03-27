@@ -92,6 +92,13 @@ class Field(eqx.Module):
             **kwargs,
         )
 
+        # # Make the weights smaller to prevent blowing up
+        # self.tensor_mlp = eqx.tree_at(
+        #     lambda tree: [linear.weight for linear in tree.mlp.layers],
+        #     self.tensor_mlp,
+        #     replace_fn=lambda x: x / 10.0,
+        # )
+
     def __call__(self, t: Array, x: Array, args) -> Array:
         return self.tensor_mlp(x)
 
@@ -160,14 +167,13 @@ class NeuralCDE(eqx.Module):
         )
 
         # Matrix output of hidden_size x (input_size + 1)
-        # Softplus for continuous differentiability
         # Tanh to prevent blowing up
         self.field = Field(
             in_shape=(hidden_size,),
             out_shape=(hidden_size, input_size + 1),
             width_size=width_size,
             depth=depth,
-            activation=jnn.softplus,
+            activation=jnn.tanh,
             final_activation=jnn.tanh,
             key=fkey,
         )
@@ -204,7 +210,6 @@ class NeuralCDE(eqx.Module):
         - z1: The final state of the Neural CDE.
         - y1: The output of the Neural CDE.
         """
-
         z0 = eqx.error_if(
             z0,
             jnp.any(jnp.isnan(z0)),
