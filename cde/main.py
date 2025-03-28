@@ -114,6 +114,7 @@ class Field(eqx.Module):
         )
 
     def __call__(self, t: Array, x: Array, args) -> Array:
+        """Time should be added as an extra dimension to the input instead of used here."""
         return self.tensor_mlp(x)
 
 
@@ -140,6 +141,7 @@ class NeuralCDE(eqx.Module):
         output_width_size: int | None = None,
         output_depth: int | None = None,
         field_activation: Callable[[Array], Array] = jnn.tanh,
+        field_weight_scale: float = 1.0,
     ) -> None:
         """
         Neural Controlled Differential Equation model.
@@ -162,6 +164,8 @@ class NeuralCDE(eqx.Module):
             If None, defaults to width_size.
         - output_depth: The number of hidden layers for the output.
             If None, defaults to 0 meaning a linear output.
+        - field_activation: The activation function for the field.
+        - field_weight_scale: The scale of the weights for the field.
         """
         ikey, fkey, okey = jr.split(key, 3)
 
@@ -193,6 +197,7 @@ class NeuralCDE(eqx.Module):
             activation=field_activation,
             final_activation=jnn.tanh,
             key=fkey,
+            weight_scale=field_weight_scale,
         )
 
         # Default to a linear output
@@ -340,7 +345,8 @@ class CDEAgent(eqx.Module):
         actor_depth: int | None = None,
         critic_width_size: int | None = None,
         critic_depth: int | None = None,
-        field_activation: Callable = jnn.tanh,
+        field_activation: Callable[[Array], Array] = jnn.softplus,
+        field_weight_scale: float = 1.0,
     ) -> None:
         """Create an actor critic model with a neural CDE.
 
@@ -363,6 +369,8 @@ class CDEAgent(eqx.Module):
         - actor_depth: Depth of the actor network.
         - critic_width_size: Width of the critic network.
         - critic_depth: Depth of the critic network.
+        - field_activation: Activation function for the field in the neural CDE.
+        - field_weight_scale: Scale of the weights for the field in the neural CDE.
         """
         assert isinstance(env.action_space(env_params), spaces.Box)
         assert isinstance(env.observation_space(env_params), spaces.Box)
@@ -387,6 +395,7 @@ class CDEAgent(eqx.Module):
             output_depth=output_depth,
             key=cde_key,
             field_activation=field_activation,
+            field_weight_scale=field_weight_scale,
         )
 
         self.actor = eqx.nn.MLP(
@@ -395,6 +404,12 @@ class CDEAgent(eqx.Module):
             width_size=actor_width_size if actor_width_size is not None else width_size,
             depth=actor_depth if actor_depth is not None else depth,
             key=actor_key,
+        )
+
+        self.actor = eqx.tree_at(
+            lambda mlp: mlp.layers[-1].weight,
+            self.actor,
+            replace_fn=lambda x: jr.normal(actor_key, x.shape) * 1e-2,
         )
 
         self.action_std = jnp.zeros(self.action_size)
@@ -407,6 +422,12 @@ class CDEAgent(eqx.Module):
             ),
             depth=critic_depth if critic_depth is not None else depth,
             key=critic_key,
+        )
+
+        self.critic = eqx.tree_at(
+            lambda mlp: mlp.layers[-1].weight,
+            self.critic,
+            replace_fn=lambda x: jr.normal(critic_key, x.shape),
         )
 
     def get_action_and_value(
@@ -556,19 +577,19 @@ class PPOArguments:
     num_batches: int
     batch_size: int
 
-    agent_timestep: float = 2e-1
+    agent_timestep: float = 0.15
 
     gamma: float = 0.99
     gae_lambda: float = 0.95
 
-    learning_rate: float = 1e-4
+    learning_rate: float = 2.5e-3
     anneal_learning_rate: bool = True
 
     normalize_advantage: bool = True
-    clip_coefficient: float = 0.1
+    clip_coefficient: float = 0.14
     clip_value_loss: bool = True
-    entropy_coefficient: float = 0.01
-    value_coefficient: float = 0.8
+    entropy_coefficient: float = 0.025
+    value_coefficient: float = 0.90
     max_gradient_norm: float = 0.5
     target_kl: float | None = None
 
@@ -707,7 +728,6 @@ def env_step(
     observation, env_state, reward, done, info = env.step(
         env_key, episode_state.env_state, clipped_action, env_params
     )
-    observation = jnp.clip(observation, -10.0, 10.0)
     termination = done
     truncation = jnp.array(False)
 
@@ -1335,18 +1355,19 @@ if __name__ == "__main__":
         output_depth=0,
         critic_width_size=8,
         critic_depth=1,
-        field_activation=jax.nn.tanh,
+        field_activation=jax.nn.softplus,
     )
 
     args = PPOArguments(
-        run_name="cde",
-        num_iterations=512,
+        run_name="Pendulum-tuned",
+        num_iterations=8096,
         num_steps=1024,
-        num_epochs=16,
-        num_minibatches=32,
-        minibatch_size=64,
+        num_epochs=8,
+        num_minibatches=64,
+        minibatch_size=16,
         num_batches=8,
-        batch_size=4,
+        batch_size=8,
+        anneal_learning_rate=False,
     )
 
     agent = train(env, env_params, agent, args, key)
