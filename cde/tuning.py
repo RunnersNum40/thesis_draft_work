@@ -1,16 +1,20 @@
-import optuna
+import equinox as eqx
+import jax.nn as jnn
 import jax.numpy as jnp
 import jax.random as jr
-import jax.nn as jnn
+import optuna
+import optunahub
 from jaxtyping import Key
 
 from main import (
-    gym,
-    train,
     CDEAgent,
     PPOArguments,
+    gym,
     reset_episode,
+    train,
 )
+
+train = eqx.filter_jit(train)
 
 
 def evaluate(
@@ -68,29 +72,56 @@ def objective(trial: optuna.Trial) -> float:
     key = jr.key(trial.number)
     env, env_params = gym.make("Pendulum-v1")
 
-    lr = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
-    entropy_coef = trial.suggest_float("entropy_coefficient", 0.0, 0.05)
-    value_coef = trial.suggest_float("value_coefficient", 0.1, 1.0)
-    clip_coef = trial.suggest_float("clip_coefficient", 0.1, 0.3)
-    agent_timestep = trial.suggest_float("agent_timestep", 0.001, 1.0, log=True)
-    field_activation = trial.suggest_categorical(
+    # === CDE / Model-Specific ===
+    hidden_size = trial.suggest_categorical("hidden_size", [4, 8, 16])
+    processed_size = trial.suggest_categorical("processed_size", [2, 4, 8])
+    width_size = trial.suggest_categorical("width_size", [16, 32, 64])
+    depth = trial.suggest_int("depth", 1, 3)
+    field_activation_name = trial.suggest_categorical(
         "field_activation", ["tanh", "softplus"]
     )
+    field_activation = {"tanh": jnn.tanh, "softplus": jnn.softplus}[
+        field_activation_name
+    ]
+    field_weight_scale = trial.suggest_float("field_weight_scale", 0.1, 1.0, step=0.1)
+
+    # === PPO ===
+    learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
+    num_epochs = trial.suggest_int("num_epochs", 2, 16)
+    clip_coefficient = trial.suggest_float("clip_coefficient", 0.1, 0.3, step=0.01)
+    entropy_coefficient = trial.suggest_float(
+        "entropy_coefficient", 0.0, 0.05, step=0.01
+    )
+    value_coefficient = trial.suggest_float("value_coefficient", 0.5, 1.0, step=0.1)
+    max_gradient_norm = trial.suggest_float("max_gradient_norm", 0.3, 1.0, step=0.01)
+    gamma = trial.suggest_float("gamma", 0.95, 0.99, step=0.01)
+    gae_lambda = trial.suggest_float("gae_lambda", 0.9, 0.97, step=0.01)
+
+    # === Sequence / Minibatch ===
+    num_steps = 1024
+    agent_timestep = trial.suggest_float("agent_timestep", 0.05, 0.3, step=0.01)
+    minibatch_size = trial.suggest_categorical("minibatch_size", [8, 16, 32])
+    num_minibatches = num_steps // minibatch_size
+    batch_size = trial.suggest_categorical("batch_size", [8, 16, 32, 64])
+    num_batches = num_minibatches // batch_size
 
     args = PPOArguments(
         run_name=f"tune-{trial.number}",
-        num_iterations=64,
+        num_iterations=128,
         num_steps=1024,
-        num_epochs=16,
-        num_minibatches=8,
-        minibatch_size=32,
-        num_batches=4,
-        batch_size=2,
+        num_epochs=num_epochs,
+        minibatch_size=minibatch_size,
+        num_minibatches=num_minibatches,
+        batch_size=batch_size,
+        num_batches=num_batches,
+        learning_rate=learning_rate,
+        clip_coefficient=clip_coefficient,
+        entropy_coefficient=entropy_coefficient,
+        value_coefficient=value_coefficient,
+        max_gradient_norm=max_gradient_norm,
+        gamma=gamma,
+        gae_lambda=gae_lambda,
         agent_timestep=agent_timestep,
-        learning_rate=lr,
-        entropy_coefficient=entropy_coef,
-        value_coefficient=value_coef,
-        clip_coefficient=clip_coef,
         anneal_learning_rate=False,
         tb_logging=False,
     )
@@ -98,15 +129,13 @@ def objective(trial: optuna.Trial) -> float:
     agent = CDEAgent(
         env=env,
         env_params=env_params,
-        hidden_size=4,
-        processed_size=4,
-        width_size=8,
-        depth=1,
+        hidden_size=hidden_size,
+        processed_size=processed_size,
+        width_size=width_size,
+        depth=depth,
         key=key,
-        actor_depth=0,
-        output_depth=0,
-        critic_depth=1,
-        field_activation={"tanh": jnn.tanh, "softplus": jnn.softplus}[field_activation],
+        field_activation=field_activation,
+        field_weight_scale=field_weight_scale,
     )
 
     agent = train(env, env_params, agent, args, key)
@@ -115,13 +144,15 @@ def objective(trial: optuna.Trial) -> float:
 
 
 if __name__ == "__main__":
+    module = optunahub.load_module(package="samplers/auto_sampler")
     study = optuna.create_study(
         direction="maximize",
-        study_name="CDEAgent",
+        study_name="CDEAgent-exhaustive",
         load_if_exists=True,
         storage="sqlite:///cde_agent.db",
+        sampler=module.AutoSampler(),
     )
-    study.optimize(objective, n_trials=100, timeout=1800, n_jobs=2)
+    study.optimize(objective, n_trials=1000, timeout=1800, n_jobs=2)
 
     print("Best trial:")
     print(study.best_params)
