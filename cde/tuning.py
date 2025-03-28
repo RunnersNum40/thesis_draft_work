@@ -1,6 +1,7 @@
 import optuna
 import jax.numpy as jnp
 import jax.random as jr
+import jax.nn as jnn
 from jaxtyping import Key
 
 from main import (
@@ -67,19 +68,18 @@ def objective(trial: optuna.Trial) -> float:
     key = jr.key(trial.number)
     env, env_params = gym.make("Pendulum-v1")
 
-    hidden_size = trial.suggest_int("hidden_size", 4, 32)
-    processed_size = trial.suggest_int("processed_size", 4, 32)
-    width_size = trial.suggest_int("width_size", 64, 256)
-    depth = trial.suggest_int("depth", 1, 3)
     lr = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
     entropy_coef = trial.suggest_float("entropy_coefficient", 0.0, 0.05)
     value_coef = trial.suggest_float("value_coefficient", 0.1, 1.0)
     clip_coef = trial.suggest_float("clip_coefficient", 0.1, 0.3)
     agent_timestep = trial.suggest_float("agent_timestep", 0.001, 1.0, log=True)
+    field_activation = trial.suggest_categorical(
+        "field_activation", ["tanh", "softplus"]
+    )
 
     args = PPOArguments(
         run_name=f"tune-{trial.number}",
-        num_iterations=10,
+        num_iterations=64,
         num_steps=1024,
         num_epochs=16,
         num_minibatches=8,
@@ -92,16 +92,21 @@ def objective(trial: optuna.Trial) -> float:
         value_coefficient=value_coef,
         clip_coefficient=clip_coef,
         anneal_learning_rate=False,
+        tb_logging=False,
     )
 
     agent = CDEAgent(
         env=env,
         env_params=env_params,
-        hidden_size=hidden_size,
-        processed_size=processed_size,
-        width_size=width_size,
-        depth=depth,
+        hidden_size=4,
+        processed_size=4,
+        width_size=8,
+        depth=1,
         key=key,
+        actor_depth=0,
+        output_depth=0,
+        critic_depth=1,
+        field_activation={"tanh": jnn.tanh, "softplus": jnn.softplus}[field_activation],
     )
 
     agent = train(env, env_params, agent, args, key)
@@ -116,7 +121,7 @@ if __name__ == "__main__":
         load_if_exists=True,
         storage="sqlite:///cde_agent.db",
     )
-    study.optimize(objective, n_trials=20, timeout=1800, n_jobs=4)
+    study.optimize(objective, n_trials=100, timeout=1800, n_jobs=2)
 
     print("Best trial:")
-    print(study.best_trial)
+    print(study.best_params)
