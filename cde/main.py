@@ -6,7 +6,7 @@ An implementation of Proximal Policy Optimization with a Neural Controlled Diffe
 import dataclasses
 import logging
 from functools import partial
-from typing import Literal
+from typing import Callable, Literal
 
 import chex
 import diffrax
@@ -139,6 +139,7 @@ class NeuralCDE(eqx.Module):
         initial_depth: int | None = None,
         output_width_size: int | None = None,
         output_depth: int | None = None,
+        field_activation: Callable[[Array], Array] = jnn.tanh,
     ) -> None:
         """
         Neural Controlled Differential Equation model.
@@ -175,7 +176,9 @@ class NeuralCDE(eqx.Module):
         self.initial = eqx.nn.MLP(
             in_size=input_size + 1,
             out_size=hidden_size,
-            width_size=initial_width_size or width_size,
+            width_size=(
+                initial_width_size if initial_width_size is not None else width_size
+            ),
             depth=initial_depth if initial_depth is not None else 0,
             key=ikey,
         )
@@ -187,7 +190,7 @@ class NeuralCDE(eqx.Module):
             out_shape=(hidden_size, input_size + 1),
             width_size=width_size,
             depth=depth,
-            activation=jnn.tanh,
+            activation=field_activation,
             final_activation=jnn.tanh,
             key=fkey,
         )
@@ -337,6 +340,7 @@ class CDEAgent(eqx.Module):
         actor_depth: int | None = None,
         critic_width_size: int | None = None,
         critic_depth: int | None = None,
+        field_activation: Callable = jnn.tanh,
     ) -> None:
         """Create an actor critic model with a neural CDE.
 
@@ -382,6 +386,7 @@ class CDEAgent(eqx.Module):
             output_width_size=output_width_size,
             output_depth=output_depth,
             key=cde_key,
+            field_activation=field_activation,
         )
 
         self.actor = eqx.nn.MLP(
@@ -551,21 +556,23 @@ class PPOArguments:
     num_batches: int
     batch_size: int
 
-    agent_timestep: float = 1e-1
+    agent_timestep: float = 2e-1
 
     gamma: float = 0.99
     gae_lambda: float = 0.95
 
-    learning_rate: float = 1e-3
+    learning_rate: float = 1e-4
     anneal_learning_rate: bool = True
 
     normalize_advantage: bool = True
-    clip_coefficient: float = 0.2
+    clip_coefficient: float = 0.1
     clip_value_loss: bool = True
     entropy_coefficient: float = 0.01
     value_coefficient: float = 0.8
     max_gradient_norm: float = 0.5
     target_kl: float | None = None
+
+    tb_logging: bool = True
 
 
 def make_empty(cls, **kwargs):
@@ -1234,9 +1241,10 @@ def train(
     args: PPOArguments,
     key: Key,
 ) -> CDEAgent:
-    env = wrappers.LogWrapper(env)
-    writer = SummaryWriter(f"runs/{args.run_name}")
-    writer.add_hparams(vars(args), {})
+    env = wrappers.LogWrapper(env)  # pyright: ignore
+    writer = SummaryWriter(f"runs/{args.run_name}") if args.tb_logging else None
+    if writer is not None:
+        writer.add_hparams(vars(args), {})
 
     agent_dynamic, agent_static = eqx.partition(agent, eqx.is_array)
 
@@ -1327,6 +1335,7 @@ if __name__ == "__main__":
         output_depth=0,
         critic_width_size=8,
         critic_depth=1,
+        field_activation=jax.nn.tanh,
     )
 
     args = PPOArguments(
