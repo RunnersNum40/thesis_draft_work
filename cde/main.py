@@ -19,6 +19,7 @@ import jax.random as jr
 import optax
 from gymnax import wrappers
 from gymnax.environments import environment, spaces
+from jax import lax
 from jaxtyping import Array, ArrayLike, Bool, Float, Int, Key, PyTree
 from torch.utils.tensorboard.writer import SummaryWriter
 
@@ -371,7 +372,7 @@ class CDEAgent(eqx.Module):
         assert isinstance(env.action_space(env_params), spaces.Box)
         assert isinstance(env.observation_space(env_params), spaces.Box)
 
-        actor_key, critic_key = jr.split(key, 2)
+        actor_key, actor_weight_key, critic_key, critic_weight_key = jr.split(key, 4)
 
         self.input_size = int(
             jnp.asarray(env.observation_space(env_params).shape).prod()
@@ -397,7 +398,7 @@ class CDEAgent(eqx.Module):
         self.actor = eqx.tree_at(
             lambda ncde: ncde.output.layers[-1].weight,
             self.actor,
-            replace_fn=lambda x: jr.normal(actor_key, x.shape) * 0.01,
+            replace_fn=lambda x: jr.normal(actor_weight_key, x.shape) * 0.01,
         )
 
         self.action_std = jnp.zeros(self.action_size)
@@ -422,7 +423,7 @@ class CDEAgent(eqx.Module):
         self.critic = eqx.tree_at(
             lambda ncde: ncde.output.layers[-1].weight,
             self.critic,
-            replace_fn=lambda x: jr.normal(actor_key, x.shape) * 1,
+            replace_fn=lambda x: jr.normal(critic_weight_key, x.shape) * 1,
         )
 
     def get_action_and_value(
@@ -540,6 +541,143 @@ class CDEAgent(eqx.Module):
         return jnp.concatenate([az0, cz0])
 
 
+class MLPAgent(eqx.Module):
+
+    input_size: int
+    state_size: int
+    action_size: int
+    actor: eqx.nn.MLP
+    action_std: Float[Array, " action_size"]
+    critic: eqx.nn.MLP
+
+    def __init__(
+        self,
+        env: environment.Environment,
+        env_params: gym.EnvParams | wrappers.purerl.GymnaxWrapper,
+        width_size: int,
+        depth: int,
+        *,
+        key: Key,
+        actor_width_size: int | None = None,
+        actor_depth: int | None = None,
+        critic_width_size: int | None = None,
+        critic_depth: int | None = None,
+    ) -> None:
+        assert isinstance(env.action_space(env_params), spaces.Box)
+        assert isinstance(env.observation_space(env_params), spaces.Box)
+
+        actor_key, actor_weight_key, critic_key, critic_weight_key = jr.split(key, 4)
+
+        self.input_size = int(
+            jnp.asarray(env.observation_space(env_params).shape).prod()
+        )
+        self.state_size = 1
+        self.action_size = int(jnp.asarray(env.action_space(env_params).shape).prod())
+
+        self.actor = eqx.nn.MLP(
+            in_size=self.input_size,
+            out_size=self.action_size,
+            width_size=actor_width_size if actor_width_size is not None else width_size,
+            depth=actor_depth if actor_depth is not None else depth,
+            key=actor_key,
+        )
+
+        self.actor = eqx.tree_at(
+            lambda mlp: mlp.layers[-1].weight,
+            self.actor,
+            replace_fn=lambda x: jr.normal(actor_weight_key, x.shape) * 0.01,
+        )
+
+        self.action_std = jnp.zeros(self.action_size)
+
+        self.critic = eqx.nn.MLP(
+            in_size=self.input_size,
+            out_size="scalar",
+            width_size=(
+                critic_width_size if critic_width_size is not None else width_size
+            ),
+            depth=critic_depth if critic_depth is not None else depth,
+            key=critic_key,
+        )
+
+        self.critic = eqx.tree_at(
+            lambda mlp: mlp.layers[-1].weight,
+            self.critic,
+            replace_fn=lambda x: jr.normal(critic_weight_key, x.shape) * 1,
+        )
+
+    def get_action_and_value(
+        self,
+        ts: Float[Array, " N"],
+        xs: Float[Array, " N {self.input_size}"],
+        a1: Float[Array, " {self.action_size}"] | None = None,
+        z0: Float[Array, " {self.state_size}"] | None = None,
+        t1: Float[Array, ""] | None = None,
+        *,
+        key: Key | None = None,
+        evolving_out: bool = False,
+    ) -> tuple[
+        Float[Array, " *N {self.state_size}"],
+        Float[Array, " *N {self.action_size}"],
+        Float[Array, " *N"],
+        Float[Array, " *N"],
+        Float[Array, " *N"],
+    ]:
+        if evolving_out:
+            action_mean = jax.vmap(self.actor)(xs)
+            value = jax.vmap(self.critic)(xs)
+            z1 = jnp.zeros((ts.shape[0], self.state_size))
+        else:
+            last_valid = jnp.sum(~jnp.isnan(ts)) - 1
+            action_mean = self.actor(xs[last_valid])
+            value = self.critic(xs[last_valid])
+            z1 = jnp.zeros((self.state_size,))
+
+        action_std = jnp.exp(self.action_std)
+
+        if a1 is None:
+            if key is not None:
+                a1 = jr.normal(key, action_mean.shape) * action_std + action_mean
+            else:
+                a1 = action_mean
+        else:
+            a1 = jnp.asarray(a1)
+
+        log_probs = jax.scipy.stats.norm.logpdf(a1, action_mean, action_std)
+        entropies = 0.5 * (jnp.log(2 * jnp.pi * action_std**2) + 1)
+
+        if evolving_out:
+            log_prob = jax.vmap(jnp.sum)(log_probs)
+            entropy = jax.vmap(jnp.sum)(entropies)
+        else:
+            log_prob = jnp.sum(log_probs)
+            entropy = jnp.sum(entropies)
+
+        if evolving_out:
+            z1 = eqx.error_if(
+                z1, z1.shape != (ts.shape[0], self.state_size), "z1 has incorrect size"
+            )
+            a1 = eqx.error_if(
+                a1, a1.shape != (ts.shape[0], self.action_size), "a1 has incorrect size"
+            )
+        else:
+            z1 = eqx.error_if(
+                z1, z1.shape != (self.state_size,), "z1 has incorrect size"
+            )
+            a1 = eqx.error_if(
+                a1, a1.shape != (self.action_size,), "a1 has incorrect size"
+            )
+
+        return z1, a1, log_prob, entropy, value
+
+    def initial_state(
+        self,
+        t0: Float[ArrayLike, ""],
+        x0: Float[ArrayLike, " {self.input_size}"],
+    ) -> Float[Array, " {self.state_size}"]:
+        return jnp.zeros(self.state_size)
+
+
 @chex.dataclass
 class EpisodeState:
     step: Int[Array, ""]
@@ -588,27 +726,27 @@ class PPOArguments:
     run_name: str
 
     num_iterations: int
-    num_steps: int
-    num_epochs: int
-    num_minibatches: int
-    minibatch_size: int
-    num_batches: int
-    batch_size: int
+    num_steps: int = 2048
+    num_epochs: int = 16
+    num_minibatches: int = 32
+    minibatch_size: int = 64
+    num_batches: int = 8
+    batch_size: int = 4
 
     agent_timestep: float = 0.1
 
     gamma: float = 0.99
     gae_lambda: float = 0.95
 
-    learning_rate: float = 2.5e-3
+    learning_rate: float = 3e-4
     anneal_learning_rate: bool = True
 
-    normalize_advantage: bool = True
-    clip_coefficient: float = 0.20
+    normalize_advantage: bool = False
+    clip_coefficient: float = 0.2
     clip_value_loss: bool = True
     entropy_coefficient: float = 0.0
-    value_coefficient: float = 0.50
-    max_gradient_norm: float = 0.50
+    value_coefficient: float = 0.5
+    max_gradient_norm: float = 0.5
     target_kl: float | None = None
 
     tb_logging: bool = True
@@ -869,18 +1007,17 @@ def calculate_gae(
     return advantages, returns
 
 
-def calculate_loss(
+def minibatch_loss(
     agent: CDEAgent,
-    times: Float[Array, " num_steps"],
-    observations: Float[Array, " num_steps observation_size"],
-    actions: Float[Array, " num_steps action_size"],
-    log_probs: Float[Array, " num_steps"],
-    values: Float[Array, " num_steps"],
-    advantages: Float[Array, " num_steps"],
-    returns: Float[Array, " num_steps"],
+    times: Float[Array, " minibatch_size"],
+    observations: Float[Array, " minibatch_size observation_size"],
+    actions: Float[Array, " minibatch_size action_size"],
+    log_probs: Float[Array, " minibatch_size"],
+    values: Float[Array, " minibatch_size"],
+    advantages: Float[Array, " minibatch_size"],
+    returns: Float[Array, " minibatch_size"],
     args: PPOArguments,
 ) -> tuple[Float[Array, ""], PPOStats]:
-    """Relies on no terminations or truncations in the rollout buffer."""
     _, _, new_log_probs, entropies, new_values = agent.get_action_and_value(
         ts=times, xs=observations, a1=actions, evolving_out=True
     )
@@ -896,9 +1033,9 @@ def calculate_loss(
 
     policy_loss = -jnp.mean(
         jnp.minimum(
-            ratio * advantages,
-            jnp.clip(ratio, 1 - args.clip_coefficient, 1 + args.clip_coefficient)
-            * advantages,
+            advantages * ratio,
+            advantages
+            * jnp.clip(ratio, 1 - args.clip_coefficient, 1 + args.clip_coefficient),
         )
     )
 
@@ -936,48 +1073,42 @@ def calculate_loss(
     return loss, stats
 
 
-def calculate_batch_loss(
+def batch_loss(
     agent: CDEAgent,
-    times: Float[Array, " N num_steps"],
-    observations: Float[Array, " N num_steps observation_size"],
-    actions: Float[Array, " N num_steps action_size"],
-    log_probs: Float[Array, " N num_steps"],
-    values: Float[Array, " N num_steps"],
-    advantages: Float[Array, " N num_steps"],
-    returns: Float[Array, " N num_steps"],
+    times: Float[Array, " batch_size minibatch_size"],
+    observations: Float[Array, " batch_size minibatch_size observation_size"],
+    actions: Float[Array, " batch_size minibatch_size action_size"],
+    log_probs: Float[Array, " batch_size minibatch_size"],
+    values: Float[Array, " batch_size minibatch_size"],
+    advantages: Float[Array, " batch_size minibatch_size"],
+    returns: Float[Array, " batch_size minibatch_size"],
     args: PPOArguments,
 ) -> tuple[Float[Array, ""], PPOStats]:
-    losses, stats = jax.vmap(partial(calculate_loss, agent, args=args))(
+    losses, stats = jax.vmap(partial(minibatch_loss, agent, args=args))(
         times, observations, actions, log_probs, values, advantages, returns
     )
     return jnp.mean(losses), jax.tree.map(jnp.mean, stats)
 
 
-calculate_batch_grad = eqx.filter_value_and_grad(calculate_batch_loss, has_aux=True)
+batch_grad = eqx.filter_value_and_grad(batch_loss, has_aux=True)
 
 
 def train_on_batch(
     agent: CDEAgent,
     optimizer: optax.GradientTransformation,
     opt_state: optax.OptState,
-    times: Float[Array, " N num_steps"],
-    observations: Float[Array, " N num_steps observation_size"],
-    actions: Float[Array, " N num_steps action_size"],
-    log_probs: Float[Array, " N num_steps"],
-    values: Float[Array, " N num_steps"],
-    advantages: Float[Array, " N num_steps"],
-    returns: Float[Array, " N num_steps"],
+    rollout: RolloutBuffer,
     args: PPOArguments,
 ) -> tuple[CDEAgent, optax.OptState, PPOStats]:
-    (_, stats), grads = calculate_batch_grad(
+    (_, stats), grads = batch_grad(
         agent,
-        times,
-        observations,
-        actions,
-        log_probs,
-        values,
-        advantages,
-        returns,
+        rollout.times,
+        rollout.observations,
+        rollout.actions,
+        rollout.log_probs,
+        rollout.values,
+        rollout.advantages,
+        rollout.returns,
         args,
     )
 
@@ -999,13 +1130,9 @@ def train_on_batch(
 
 
 def get_batch_indices(
-    batch_size: int, dataset_size: int, num_batches: int, key: Key | None = None
+    batch_size: int, dataset_size: int, num_batches: int, key: Key
 ) -> Int[Array, " {num_batches} {batch_size}"]:
-    if key is None:
-        indices = jnp.arange(dataset_size)
-    else:
-        indices = jr.permutation(key, dataset_size)
-
+    indices = jr.permutation(key, dataset_size)
     total_required = batch_size * num_batches
     tiled_indices = jnp.tile(indices, (total_required // dataset_size + 1,))
     selected = tiled_indices[:total_required]
@@ -1016,17 +1143,13 @@ def epoch(
     agent: CDEAgent,
     optimizer: optax.GradientTransformation,
     opt_state: optax.OptState,
-    times: Float[Array, " N num_steps"],
-    observations: Float[Array, " N num_steps observation_size"],
-    actions: Float[Array, " N num_steps action_size"],
-    log_probs: Float[Array, " N num_steps"],
-    values: Float[Array, " N num_steps"],
-    advantages: Float[Array, " N num_steps"],
-    returns: Float[Array, " N num_steps"],
+    rollout: RolloutBuffer,
     args: PPOArguments,
-    key: Key | None,
+    key: Key,
 ) -> tuple[CDEAgent, optax.OptState, PPOStats]:
     agent_dynamic, agent_static = eqx.partition(agent, eqx.is_array)
+    minibatch_key, batch_key = jr.split(key, 2)
+    rollout = minibatch_rollout(rollout, args, minibatch_key)
 
     def scan_batch(
         carry: tuple[PyTree, optax.OptState], xs: Int[Array, " batch_size"]
@@ -1034,36 +1157,24 @@ def epoch(
         agent_dynamic, opt_state = carry
         agent = eqx.combine(agent_dynamic, agent_static)
 
-        (
-            times_batch,
-            observations_batch,
-            actions_batch,
-            log_probs_batch,
-            values_batch,
-            advantages_batch,
-            returns_batch,
-        ) = jax.tree.map(
-            lambda x: x[xs],
-            (times, observations, actions, log_probs, values, advantages, returns),
+        batch_rollout = jax.tree.map(
+            partial(jnp.take, indices=xs, axis=0),
+            rollout,
         )
 
         agent, opt_state, stats = train_on_batch(
             agent,
             optimizer,
             opt_state,
-            times_batch,
-            observations_batch,
-            actions_batch,
-            log_probs_batch,
-            values_batch,
-            advantages_batch,
-            returns_batch,
+            batch_rollout,
             args,
         )
         agent_dynamic, _ = eqx.partition(agent, eqx.is_array)
         return (agent_dynamic, opt_state), stats
 
-    indices = get_batch_indices(args.batch_size, times.shape[0], args.num_batches, key)
+    indices = get_batch_indices(
+        args.batch_size, args.num_minibatches, args.num_batches, batch_key
+    )
     (agent_dynamic, opt_state), stats = jax.lax.scan(
         scan_batch, (agent_dynamic, opt_state), indices
     )
@@ -1074,84 +1185,27 @@ def epoch(
     return agent, opt_state, stats
 
 
-def minibatch_rollout(rollout: RolloutBuffer, args: PPOArguments, key: Key) -> tuple[
-    Float[Array, "num_minibatches minibatch_size"],
-    Float[Array, "num_minibatches minibatch_size observation_size"],
-    Float[Array, "num_minibatches minibatch_size action_size"],
-    Float[Array, "num_minibatches minibatch_size"],
-    Float[Array, "num_minibatches minibatch_size"],
-    Float[Array, "num_minibatches minibatch_size"],
-    Float[Array, "num_minibatches minibatch_size"],
-]:
-    """Extract minibatches of contiguous sequences from a rollout buffer.
+@eqx.filter_jit
+def minibatch_rollout(
+    rollout: RolloutBuffer, args: PPOArguments, key: Key
+) -> RolloutBuffer:
+    dones = rollout.terminations | rollout.truncations
+    possible_indices = jnp.arange(args.num_steps - args.minibatch_size + 1)
+    valid_indices = jax.vmap(
+        lambda i: ~jnp.any(lax.dynamic_slice(dones, (i,), (args.minibatch_size,)))
+    )(possible_indices)
 
-    Given a rollout buffer, this function identifies and extracts sequences of consecutive
-    steps without episode terminations or truncations. The sequences are grouped into
-    minibatches suitable for batch training. If insufficient valid sequences are found, existing
-    sequences are duplicated to meet the required batch size.
-
-    Arguments:
-    - rollout: Rollout buffer containing episode data.
-    - args: PPO training arguments specifying:
-        - `num_minibatches`: Number of minibatches to generate.
-        - `minibatch_size`: Number of steps per minibatch.
-    - key: Key for shuffling and duplication.
-
-    Returns:
-    - times: `[num_minibatches, minibatch_size]`
-    - observations: `[num_minibatches, minibatch_size, observation_size]`
-    - actions: `[num_minibatches, minibatch_size, action_size]`
-    - log_probs: `[num_minibatches, minibatch_size]`
-    - values: `[num_minibatches, minibatch_size]`
-    - advantages: `[num_minibatches, minibatch_size]`
-    - returns: `[num_minibatches, minibatch_size]`
-
-    Notes:
-        Each minibatch contains sequences that are strictly contiguous within an episode,
-        ensuring temporal consistency required by sequential models.
-    """
-    episode_boundaries = rollout.terminations | rollout.truncations
-
-    def is_valid_start(idx):
-        offset = jnp.arange(args.minibatch_size - 1)
-        indices = idx + offset
-
-        in_bounds = (idx + args.minibatch_size - 1) < args.num_steps
-        no_boundary = ~jnp.any(jnp.where(in_bounds, episode_boundaries[indices], True))
-
-        return in_bounds & no_boundary
-
-    all_indices = jnp.arange(args.num_steps - args.minibatch_size + 1)
-    valid_mask = jax.vmap(is_valid_start)(all_indices)
-    valid_indices = jnp.nonzero(valid_mask, size=all_indices.shape[0], fill_value=-1)[0]
-    num_valid = jnp.sum(valid_mask)
-
-    valid_indices = eqx.error_if(
-        valid_indices,
-        num_valid == 0,
-        "No valid batches found",
+    sampled_indices = jr.choice(
+        key, possible_indices, shape=(args.num_minibatches,), p=valid_indices
     )
+    indices = sampled_indices[:, None] + jnp.arange(args.minibatch_size)
+    # indices = jr.permutation(key, jnp.arange(args.num_steps))[
+    #     : args.num_minibatches * args.minibatch_size
+    # ].reshape((args.num_minibatches, args.minibatch_size))
 
-    final_start_indices = jr.choice(
-        key,
-        valid_indices,
-        shape=(args.num_minibatches,),
-        replace=True,
-        p=(valid_indices >= 0) / jnp.sum(valid_indices >= 0),
-    )
+    rollout = jax.tree.map(partial(jnp.take, indices=indices, axis=0), rollout)
 
-    offsets = jnp.arange(args.minibatch_size)
-    final_indices = final_start_indices[:, None] + offsets[None, :]
-
-    times = rollout.times[final_indices]
-    observations = rollout.observations[final_indices]
-    actions = rollout.actions[final_indices]
-    log_probs = rollout.log_probs[final_indices]
-    values = rollout.values[final_indices]
-    advantages = rollout.advantages[final_indices]
-    returns = rollout.returns[final_indices]
-
-    return times, observations, actions, log_probs, values, advantages, returns
+    return rollout
 
 
 def train_on_rollout(
@@ -1163,17 +1217,6 @@ def train_on_rollout(
     key: Key,
 ) -> tuple[CDEAgent, optax.OptState, PPOStats]:
     agent_dynamic, agent_static = eqx.partition(agent, eqx.is_array)
-    batching_key, epoch_key = jr.split(key, 2)
-
-    (
-        times,
-        observations,
-        actions,
-        log_probs,
-        values,
-        advantages,
-        returns,
-    ) = minibatch_rollout(rollout, args, batching_key)
 
     def scan_epoch(
         carry: tuple[PyTree, optax.OptState, Key],
@@ -1187,13 +1230,7 @@ def train_on_rollout(
             agent,
             optimizer,
             opt_state,
-            times,
-            observations,
-            actions,
-            log_probs,
-            values,
-            advantages,
-            returns,
+            rollout,
             args,
             batch_key,
         )
@@ -1202,7 +1239,7 @@ def train_on_rollout(
         return (agent_dynamic, opt_state, carry_key), stats
 
     (agent_dynamic, opt_state, _), stats = jax.lax.scan(
-        scan_epoch, (agent_dynamic, opt_state, epoch_key), length=args.num_epochs
+        scan_epoch, (agent_dynamic, opt_state, key), length=args.num_epochs
     )
 
     stats = jax.tree.map(jnp.mean, stats)
@@ -1281,6 +1318,12 @@ def train(
 ) -> CDEAgent:
     env = wrappers.LogWrapper(env)  # pyright: ignore
     writer = SummaryWriter(f"runs/{args.run_name}") if args.tb_logging else None
+    if writer is not None:
+        writer.add_text(
+            "hyperparameters",
+            "|param|value|\n|-|-|\n%s"
+            % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        )
 
     agent_dynamic, agent_static = eqx.partition(agent, eqx.is_array)
 
@@ -1353,30 +1396,74 @@ def train(
 
 
 if __name__ == "__main__":
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     key = jr.key(0)
     env, env_params = gym.make("Pendulum-v1")
 
-    agent = CDEAgent(
+    agent = MLPAgent(
         env=env,
         env_params=env_params,
-        hidden_size=4,
-        width_size=16,
-        depth=1,
+        width_size=64,
+        depth=2,
         key=key,
-        field_activation=jnn.softplus,
     )
 
+    num_steps = 2048
+    minibatch_size = 8
+    num_minibatches = num_steps // minibatch_size
+    num_batches = 8
+    batch_size = num_minibatches // num_batches
+
     args = PPOArguments(
-        run_name="Pendulum",
-        num_iterations=8096,
-        num_steps=1024,
-        num_epochs=8,
-        num_minibatches=128,
-        minibatch_size=8,
-        num_batches=32,
-        batch_size=4,
-        anneal_learning_rate=False,
+        run_name="mlp-agent",
+        num_iterations=512,
+        num_steps=num_steps,
+        num_epochs=16,
+        num_minibatches=num_minibatches,
+        minibatch_size=minibatch_size,
+        num_batches=num_batches,
+        batch_size=batch_size,
+        anneal_learning_rate=True,
     )
 
     agent = train(env, env_params, agent, args, key)
+
+# if __name__ == "__main__":
+#     key = jr.key(0)
+#     action_size = 2
+#     observation_size = 2
+#     num_steps = 1028
+#     num_minibatches = num_steps
+#     minibatch_size = num_steps // num_minibatches
+#     num_batches = 8
+#     batch_size = num_minibatches // num_batches
+#
+#     rollout = RolloutBuffer(
+#         observations=jnp.tile(jnp.arange(num_steps), (1, observation_size)),
+#         actions=jnp.tile(jnp.arange(num_steps), (1, action_size)),
+#         log_probs=jnp.arange(num_steps),
+#         entropies=jnp.arange(num_steps),
+#         values=jnp.arange(num_steps),
+#         rewards=jnp.arange(num_steps),
+#         terminations=jnp.full((num_steps,), False),
+#         truncations=jnp.full((num_steps,), False),
+#         advantages=jnp.arange(num_steps),
+#         returns=jnp.arange(num_steps),
+#         times=jnp.arange(num_steps),
+#     )
+#     rollout.terminations = rollout.terminations.at[num_steps // 2].set(True)
+#     args = PPOArguments(
+#         run_name="dummy",
+#         num_iterations=1,
+#         num_steps=num_steps,
+#         num_minibatches=num_minibatches,
+#         minibatch_size=minibatch_size,
+#         num_batches=num_batches,
+#         batch_size=batch_size,
+#     )
+#     rollout = minibatch_rollout(rollout, args, key)
+#
+#     print("Times:")
+#     print(rollout.times)
+#     for term in rollout.terminations:
+#         assert not term.any(), "Termination should be False"

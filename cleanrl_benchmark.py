@@ -16,57 +16,31 @@ from torch.utils.tensorboard.writer import SummaryWriter
 @dataclass
 class Args:
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
-    """the name of this experiment"""
     seed: int = 1
-    """seed of the experiment"""
     torch_deterministic: bool = True
-    """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
-    """if toggled, cuda will be enabled by default"""
 
-    # Algorithm specific arguments
     env_id: str = "Pendulum-v1"
-    """the id of the environment"""
     total_timesteps: int = 1000000
-    """total timesteps of the experiments"""
     learning_rate: float = 3e-4
-    """the learning rate of the optimizer"""
     num_envs: int = 1
-    """the number of parallel game environments"""
     num_steps: int = 2048
-    """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
-    """Toggle learning rate annealing for policy and value networks"""
     gamma: float = 0.99
-    """the discount factor gamma"""
     gae_lambda: float = 0.95
-    """the lambda for the general advantage estimation"""
     num_minibatches: int = 32
-    """the number of mini-batches"""
     update_epochs: int = 10
-    """the K epochs to update the policy"""
     norm_adv: bool = True
-    """Toggles advantages normalization"""
     clip_coef: float = 0.2
-    """the surrogate clipping coefficient"""
     clip_vloss: bool = True
-    """Toggles whether or not to use a clipped loss for the value function, as per the paper."""
     ent_coef: float = 0.0
-    """coefficient of the entropy"""
     vf_coef: float = 0.5
-    """coefficient of the value function"""
     max_grad_norm: float = 0.5
-    """the maximum norm for the gradient clipping"""
     target_kl: float | None = None
-    """the target KL divergence threshold"""
 
-    # to be filled in runtime
     batch_size: int = 0
-    """the batch size (computed in runtime)"""
     minibatch_size: int = 0
-    """the mini-batch size (computed in runtime)"""
     num_iterations: int = 0
-    """the number of iterations (computed in runtime)"""
 
 
 def make_env(env_id):
@@ -74,9 +48,6 @@ def make_env(env_id):
         env = gym.make(env_id)
         env = gym.wrappers.RecordEpisodeStatistics(env)
         env = gym.wrappers.ClipAction(env)
-        env = gym.wrappers.TransformObservation(
-            env, lambda o: o[:2], gym.spaces.Box(-np.inf, np.inf, (2,))
-        )
         return env
 
     return thunk
@@ -141,7 +112,7 @@ if __name__ == "__main__":
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     print(f"Starting {run_name}")
 
-    writer = SummaryWriter(f"runs/{run_name}")
+    writer = SummaryWriter(f"cde/runs/cleanrl")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s"
@@ -228,7 +199,6 @@ if __name__ == "__main__":
                     if di:
                         writer.add_scalar("episode/reward", ri, global_step)
                         writer.add_scalar("episode/length", li, global_step)
-                        writer.add_scalar("episode/time", ti, global_step)
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -332,8 +302,8 @@ if __name__ == "__main__":
         writer.add_scalar("loss/value", v_loss.item(), global_step)
         writer.add_scalar("loss/policy", pg_loss.item(), global_step)
         writer.add_scalar("loss/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar("loss/kl", approx_kl.item(), global_step)
-        writer.add_scalar("loss/explained_variance", explained_var, global_step)
+        writer.add_scalar("stats/approx_kl", approx_kl.item(), global_step)
+        writer.add_scalar("stats/explained_variance", explained_var, global_step)
 
     envs.close()
     writer.close()
