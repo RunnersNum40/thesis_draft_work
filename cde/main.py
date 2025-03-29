@@ -95,7 +95,7 @@ class Field(eqx.Module):
         out_shape: tuple[int, ...] | Literal["scalar"],
         *,
         key: Array,
-        weight_scale: float = 1.0,
+        weight_scale: float | None = 1.0,
         **kwargs,
     ) -> None:
         self.tensor_mlp = TensorMLP(
@@ -107,11 +107,12 @@ class Field(eqx.Module):
             **kwargs,
         )
 
-        self.tensor_mlp = eqx.tree_at(
-            lambda tree: [linear.weight for linear in tree.mlp.layers],
-            self.tensor_mlp,
-            replace_fn=lambda x: x * weight_scale,
-        )
+        if weight_scale is not None:
+            self.tensor_mlp = eqx.tree_at(
+                lambda tensor_mlp: tensor_mlp.mlp.layers[-1].weight,
+                self.tensor_mlp,
+                replace_fn=lambda x: jr.normal(key, x.shape) * weight_scale,
+            )
 
     def __call__(self, t: Array, x: Array, args) -> Array:
         """Time should be added as an extra dimension to the input instead of used here."""
@@ -322,17 +323,15 @@ class CDEAgent(eqx.Module):
     input_size: int
     state_size: int
     action_size: int
-    neural_cde: NeuralCDE
-    actor: eqx.nn.MLP
+    actor: NeuralCDE
     action_std: Float[Array, " action_size"]
-    critic: eqx.nn.MLP
+    critic: NeuralCDE
 
     def __init__(
         self,
         env: environment.Environment,
         env_params: gym.EnvParams | wrappers.purerl.GymnaxWrapper,
         hidden_size: int,
-        processed_size: int,
         width_size: int,
         depth: int,
         *,
@@ -346,7 +345,6 @@ class CDEAgent(eqx.Module):
         critic_width_size: int | None = None,
         critic_depth: int | None = None,
         field_activation: Callable[[Array], Array] = jnn.softplus,
-        field_weight_scale: float = 1.0,
     ) -> None:
         """Create an actor critic model with a neural CDE.
 
@@ -357,7 +355,6 @@ class CDEAgent(eqx.Module):
         - env: Environment to interact with.
         - env_params: Parameters for the environment.
         - hidden_size: Size of the hidden state in the neural CDE.
-        - processed_size: Size of the processed state shared between the actor and critic.
         - width_size: Width of the neural CDE.
         - depth: Depth of the neural CDE.
         - key: Random key for initialization.
@@ -370,64 +367,62 @@ class CDEAgent(eqx.Module):
         - critic_width_size: Width of the critic network.
         - critic_depth: Depth of the critic network.
         - field_activation: Activation function for the field in the neural CDE.
-        - field_weight_scale: Scale of the weights for the field in the neural CDE.
         """
         assert isinstance(env.action_space(env_params), spaces.Box)
         assert isinstance(env.observation_space(env_params), spaces.Box)
 
-        cde_key, actor_key, critic_key = jr.split(key, 3)
+        actor_key, critic_key = jr.split(key, 2)
 
         self.input_size = int(
             jnp.asarray(env.observation_space(env_params).shape).prod()
         )
-        self.state_size = hidden_size
+        self.state_size = hidden_size * 2
         self.action_size = int(jnp.asarray(env.action_space(env_params).shape).prod())
 
-        self.neural_cde = NeuralCDE(
+        self.actor = NeuralCDE(
             input_size=self.input_size,
             hidden_size=hidden_size,
-            output_size=processed_size,
-            width_size=width_size,
-            depth=depth,
+            output_size=self.action_size,
+            width_size=actor_width_size if actor_width_size is not None else width_size,
+            depth=actor_depth if actor_depth is not None else depth,
             initial_width_size=initial_width_size,
             initial_depth=initial_depth,
             output_width_size=output_width_size,
             output_depth=output_depth,
-            key=cde_key,
-            field_activation=field_activation,
-            field_weight_scale=field_weight_scale,
-        )
-
-        self.actor = eqx.nn.MLP(
-            in_size=processed_size,
-            out_size=self.action_size,
-            width_size=actor_width_size if actor_width_size is not None else width_size,
-            depth=actor_depth if actor_depth is not None else depth,
             key=actor_key,
+            field_activation=field_activation,
+            field_weight_scale=0.1,
         )
 
         self.actor = eqx.tree_at(
-            lambda mlp: mlp.layers[-1].weight,
+            lambda ncde: ncde.output.layers[-1].weight,
             self.actor,
-            replace_fn=lambda x: jr.normal(actor_key, x.shape) * 1e-2,
+            replace_fn=lambda x: jr.normal(actor_key, x.shape) * 0.01,
         )
 
         self.action_std = jnp.zeros(self.action_size)
 
-        self.critic = eqx.nn.MLP(
-            in_size=processed_size,
-            out_size="scalar",
+        self.critic = NeuralCDE(
+            input_size=self.input_size,
+            hidden_size=hidden_size,
+            output_size="scalar",
             width_size=(
                 critic_width_size if critic_width_size is not None else width_size
             ),
             depth=critic_depth if critic_depth is not None else depth,
+            initial_width_size=initial_width_size,
+            initial_depth=initial_depth,
+            output_width_size=output_width_size,
+            output_depth=output_depth,
             key=critic_key,
+            field_activation=field_activation,
+            field_weight_scale=0.1,
         )
 
         self.critic = eqx.tree_at(
-            lambda mlp: mlp.layers[-1].weight,
+            lambda ncde: ncde.output.layers[-1].weight,
             self.critic,
-            replace_fn=lambda x: jr.normal(critic_key, x.shape),
+            replace_fn=lambda x: jr.normal(actor_key, x.shape) * 1,
         )
 
     def get_action_and_value(
@@ -470,18 +465,22 @@ class CDEAgent(eqx.Module):
         - entropy: Entropy of the action distribution.
         - value: Value of the final state.
         """
-        z0 = z0 or self.neural_cde.initial_state(ts[0], xs[0])
+        z0 = z0 or self.initial_state(ts[0], xs[0])
+        az0, cz0 = jnp.split(z0, [self.actor.state_size])
+        az0 = eqx.error_if(
+            az0, az0.shape != (self.actor.state_size,), "az0 has incorrect size"
+        )
+        cz0 = eqx.error_if(
+            cz0, cz0.shape != (self.critic.state_size,), "cz0 has incorrect size"
+        )
         t1 = t1 or jnp.max(ts)
 
-        z1, processed = self.neural_cde(
-            jnp.asarray(ts), jnp.asarray(xs), z0=z0, t1=t1, evolving_out=evolving_out
-        )
+        azs, action_mean = self.actor(ts, xs, z0=az0, t1=t1, evolving_out=evolving_out)
+        czs, value = self.critic(ts, xs, z0=cz0, t1=t1, evolving_out=evolving_out)
         if evolving_out:
-            action_mean = jax.vmap(self.actor)(processed)
-            value = jax.vmap(self.critic)(processed)
+            z1 = jnp.concatenate([azs, czs], axis=-1)
         else:
-            action_mean = self.actor(processed)
-            value = self.critic(processed)
+            z1 = jnp.concatenate([azs, czs])
 
         action_std = jnp.exp(self.action_std)
 
@@ -503,6 +502,21 @@ class CDEAgent(eqx.Module):
             log_prob = jnp.sum(log_probs)
             entropy = jnp.sum(entropies)
 
+        if evolving_out:
+            z1 = eqx.error_if(
+                z1, z1.shape != (ts.shape[0], self.state_size), "z1 has incorrect size"
+            )
+            a1 = eqx.error_if(
+                a1, a1.shape != (ts.shape[0], self.action_size), "a1 has incorrect size"
+            )
+        else:
+            z1 = eqx.error_if(
+                z1, z1.shape != (self.state_size,), "z1 has incorrect size"
+            )
+            a1 = eqx.error_if(
+                a1, a1.shape != (self.action_size,), "a1 has incorrect size"
+            )
+
         return z1, a1, log_prob, entropy, value
 
     def initial_state(
@@ -519,7 +533,11 @@ class CDEAgent(eqx.Module):
         Returns:
         - z0: Initial state of the actor-critic model.
         """
-        return self.neural_cde.initial_state(jnp.asarray(t0), jnp.asarray(x0))
+        t0 = jnp.asarray(t0)
+        x0 = jnp.asarray(x0)
+        az0 = self.actor.initial_state(t0, x0)
+        cz0 = self.critic.initial_state(t0, x0)
+        return jnp.concatenate([az0, cz0])
 
 
 @chex.dataclass
@@ -577,7 +595,7 @@ class PPOArguments:
     num_batches: int
     batch_size: int
 
-    agent_timestep: float = 0.15
+    agent_timestep: float = 0.1
 
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -586,11 +604,11 @@ class PPOArguments:
     anneal_learning_rate: bool = True
 
     normalize_advantage: bool = True
-    clip_coefficient: float = 0.14
+    clip_coefficient: float = 0.20
     clip_value_loss: bool = True
-    entropy_coefficient: float = 0.025
-    value_coefficient: float = 0.90
-    max_gradient_norm: float = 0.5
+    entropy_coefficient: float = 0.0
+    value_coefficient: float = 0.50
+    max_gradient_norm: float = 0.50
     target_kl: float | None = None
 
     tb_logging: bool = True
@@ -1065,7 +1083,7 @@ def minibatch_rollout(rollout: RolloutBuffer, args: PPOArguments, key: Key) -> t
     Float[Array, "num_minibatches minibatch_size"],
     Float[Array, "num_minibatches minibatch_size"],
 ]:
-    """Extract minibatches of contiguous sequences from a rollout buffer for PPO training.
+    """Extract minibatches of contiguous sequences from a rollout buffer.
 
     Given a rollout buffer, this function identifies and extracts sequences of consecutive
     steps without episode terminations or truncations. The sequences are grouped into
@@ -1263,8 +1281,6 @@ def train(
 ) -> CDEAgent:
     env = wrappers.LogWrapper(env)  # pyright: ignore
     writer = SummaryWriter(f"runs/{args.run_name}") if args.tb_logging else None
-    if writer is not None:
-        writer.add_hparams(vars(args), {})
 
     agent_dynamic, agent_static = eqx.partition(agent, eqx.is_array)
 
@@ -1337,36 +1353,29 @@ def train(
 
 
 if __name__ == "__main__":
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     key = jr.key(0)
     env, env_params = gym.make("Pendulum-v1")
 
     agent = CDEAgent(
         env=env,
         env_params=env_params,
-        hidden_size=2,
-        processed_size=2,
+        hidden_size=4,
         width_size=16,
         depth=1,
         key=key,
-        actor_width_size=8,
-        actor_depth=0,
-        output_width_size=8,
-        output_depth=0,
-        critic_width_size=8,
-        critic_depth=1,
-        field_activation=jax.nn.softplus,
+        field_activation=jnn.softplus,
     )
 
     args = PPOArguments(
-        run_name="Pendulum-tuned",
+        run_name="Pendulum",
         num_iterations=8096,
         num_steps=1024,
         num_epochs=8,
-        num_minibatches=64,
-        minibatch_size=16,
-        num_batches=8,
-        batch_size=8,
+        num_minibatches=128,
+        minibatch_size=8,
+        num_batches=32,
+        batch_size=4,
         anneal_learning_rate=False,
     )
 
