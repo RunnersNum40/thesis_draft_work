@@ -239,6 +239,14 @@ class NeuralCDE(eqx.Module):
         - z1: The final state of the Neural CDE.
         - y1: The output of the Neural CDE.
         """
+        assert ts.ndim == 1
+        assert xs.ndim == 2
+        assert z0.ndim == 1
+        assert xs.shape[0] == ts.shape[0]
+
+        if t1 is not None:
+            assert t1.ndim == 0
+            t1 = eqx.error_if(t1, jnp.isnan(t1), "t1 is NaN")
         if evolving_out:
             ts = eqx.error_if(ts, jnp.isnan(ts).any(), "ts contains NaNs")
             xs = eqx.error_if(xs, jnp.isnan(xs).any(), "xs contains NaNs")
@@ -246,11 +254,6 @@ class NeuralCDE(eqx.Module):
         if self.input_size == "scalar":
             assert xs.ndim == 1
             xs = jnp.expand_dims(xs, axis=-1)
-
-        assert ts.ndim == 1
-        assert xs.ndim == 2
-        assert z0.ndim == 1
-        assert xs.shape[0] == ts.shape[0]
 
         # Don't actually solve an ODE if there's no time change
         if len(ts) == 1:
@@ -327,7 +330,7 @@ class CDEAgent(eqx.Module):
     action_size: int
     actor: NeuralCDE
     action_std: Float[Array, " action_size"]
-    critic: NeuralCDE
+    critic: eqx.nn.MLP
 
     def __init__(
         self,
@@ -378,7 +381,7 @@ class CDEAgent(eqx.Module):
         self.input_size = int(
             jnp.asarray(env.observation_space(env_params).shape).prod()
         )
-        self.state_size = hidden_size * 2
+        self.state_size = hidden_size
         self.action_size = int(jnp.asarray(env.action_space(env_params).shape).prod())
 
         self.actor = NeuralCDE(
@@ -404,25 +407,18 @@ class CDEAgent(eqx.Module):
 
         self.action_std = jnp.zeros(self.action_size)
 
-        self.critic = NeuralCDE(
-            input_size=self.input_size,
-            hidden_size=hidden_size,
-            output_size="scalar",
+        self.critic = eqx.nn.MLP(
+            in_size=self.input_size,
+            out_size="scalar",
             width_size=(
                 critic_width_size if critic_width_size is not None else width_size
             ),
             depth=critic_depth if critic_depth is not None else depth,
-            initial_width_size=initial_width_size,
-            initial_depth=initial_depth,
-            output_width_size=output_width_size,
-            output_depth=output_depth,
             key=critic_key,
-            field_activation=field_activation,
-            field_weight_scale=0.1,
         )
 
         self.critic = eqx.tree_at(
-            lambda ncde: ncde.output.layers[-1].weight,
+            lambda mlp: mlp.layers[-1].weight,
             self.critic,
             replace_fn=lambda x: jr.normal(critic_weight_key, x.shape) * 1,
         )
@@ -468,21 +464,14 @@ class CDEAgent(eqx.Module):
         - value: Value of the final state.
         """
         z0 = z0 or self.initial_state(ts[0], xs[0])
-        az0, cz0 = jnp.split(z0, [self.actor.state_size])
-        az0 = eqx.error_if(
-            az0, az0.shape != (self.actor.state_size,), "az0 has incorrect size"
-        )
-        cz0 = eqx.error_if(
-            cz0, cz0.shape != (self.critic.state_size,), "cz0 has incorrect size"
-        )
         t1 = t1 or jnp.nanmax(ts)
 
-        azs, action_mean = self.actor(ts, xs, z0=az0, t1=t1, evolving_out=evolving_out)
-        czs, value = self.critic(ts, xs, z0=cz0, t1=t1, evolving_out=evolving_out)
+        z1, action_mean = self.actor(ts, xs, z0=z0, t1=t1, evolving_out=evolving_out)
         if evolving_out:
-            z1 = jnp.concatenate([azs, czs], axis=-1)
+            value = jax.vmap(self.critic)(xs)
         else:
-            z1 = jnp.concatenate([azs, czs])
+            last_valid = jnp.sum(~jnp.isnan(ts)) - 1
+            value = self.critic(xs[last_valid])
 
         action_std = jnp.exp(self.action_std)
 
@@ -537,9 +526,7 @@ class CDEAgent(eqx.Module):
         """
         t0 = jnp.asarray(t0)
         x0 = jnp.asarray(x0)
-        az0 = self.actor.initial_state(t0, x0)
-        cz0 = self.critic.initial_state(t0, x0)
-        return jnp.concatenate([az0, cz0])
+        return self.actor.initial_state(t0, x0)
 
 
 class MLPAgent(eqx.Module):
@@ -737,7 +724,7 @@ class PPOArguments:
     num_batches: int = 8
     batch_size: int = 4
 
-    agent_timestep: float = 1.0
+    agent_timestep: float = 0.1
 
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -1155,7 +1142,7 @@ def epoch(
 ) -> tuple[CDEAgent, optax.OptState, PPOStats]:
     agent_dynamic, agent_static = eqx.partition(agent, eqx.is_array)
     minibatch_key, batch_key = jr.split(key, 2)
-    rollout = minibatch_rollout(rollout, args, minibatch_key)
+    rollout = split_into_minibatches(rollout, args, minibatch_key)
 
     def scan_batch(
         carry: tuple[PyTree, optax.OptState], xs: Int[Array, " batch_size"]
@@ -1191,8 +1178,7 @@ def epoch(
     return agent, opt_state, stats
 
 
-@eqx.filter_jit
-def minibatch_rollout(
+def split_into_minibatches(
     rollout: RolloutBuffer, args: PPOArguments, key: Key
 ) -> RolloutBuffer:
     dones = rollout.terminations | rollout.truncations
@@ -1450,16 +1436,16 @@ class TransformRewardWrapper(GymnaxWrapper):
 
 
 if __name__ == "__main__":
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
     key = jr.key(0)
     env, env_params = gym.make("Pendulum-v1")
 
     agent = CDEAgent(
         env=env,
         env_params=env_params,
-        hidden_size=4,
-        width_size=64,
-        depth=1,
+        hidden_size=8,
+        width_size=128,
+        depth=2,
         key=key,
     )
 
@@ -1478,7 +1464,7 @@ if __name__ == "__main__":
         minibatch_size=minibatch_size,
         num_batches=num_batches,
         batch_size=batch_size,
-        anneal_learning_rate=True,
+        anneal_learning_rate=False,
     )
 
     agent = train(env, env_params, agent, args, key)
