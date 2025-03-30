@@ -955,6 +955,8 @@ def collect_rollout(
             global_step,
         )
 
+    episode_state = rollover_episode_state(episode_state)
+
     def scan_step(
         carry: tuple[EpisodeState, TrainingState, Key],
         _: None,
