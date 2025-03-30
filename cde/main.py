@@ -6,7 +6,7 @@ An implementation of Proximal Policy Optimization with a Neural Controlled Diffe
 import dataclasses
 import logging
 from functools import partial
-from typing import Callable, Literal
+from typing import Any, Callable, Literal
 
 import chex
 import diffrax
@@ -19,6 +19,7 @@ import jax.random as jr
 import optax
 from gymnax import wrappers
 from gymnax.environments import environment, spaces
+from gymnax.wrappers.purerl import GymnaxWrapper
 from jax import lax
 from jaxtyping import Array, ArrayLike, Bool, Float, Int, Key, PyTree
 from torch.utils.tensorboard.writer import SummaryWriter
@@ -330,8 +331,8 @@ class CDEAgent(eqx.Module):
 
     def __init__(
         self,
-        env: environment.Environment,
-        env_params: gym.EnvParams | wrappers.purerl.GymnaxWrapper,
+        env: environment.Environment | GymnaxWrapper,
+        env_params: gym.EnvParams,
         hidden_size: int,
         width_size: int,
         depth: int,
@@ -542,6 +543,9 @@ class CDEAgent(eqx.Module):
 
 
 class MLPAgent(eqx.Module):
+    """Agent with the same interface as the stateful CDE Agent but uses regular MLPs
+    for action and value generation.
+    """
 
     input_size: int
     state_size: int
@@ -552,8 +556,8 @@ class MLPAgent(eqx.Module):
 
     def __init__(
         self,
-        env: environment.Environment,
-        env_params: gym.EnvParams | wrappers.purerl.GymnaxWrapper,
+        env: environment.Environment | GymnaxWrapper,
+        env_params: gym.EnvParams,
         width_size: int,
         depth: int,
         *,
@@ -765,7 +769,7 @@ def make_empty(cls, **kwargs):
 
 
 def reset_episode(
-    env: wrappers.LogWrapper | environment.Environment,
+    env: environment.Environment | GymnaxWrapper,
     env_params: gym.EnvParams,
     args: PPOArguments,
     *,
@@ -840,7 +844,7 @@ def rollover_episode_state(episode_state: EpisodeState) -> EpisodeState:
 
 
 def env_step(
-    env: environment.Environment | wrappers.LogWrapper,
+    env: environment.Environment | GymnaxWrapper,
     env_params: gym.EnvParams,
     agent: CDEAgent,
     episode_state: EpisodeState,
@@ -916,7 +920,7 @@ def env_step(
 
 
 def collect_rollout(
-    env: environment.Environment | wrappers.LogWrapper,
+    env: environment.Environment | GymnaxWrapper,
     env_params: gym.EnvParams,
     agent: CDEAgent,
     episode_state: EpisodeState,
@@ -1310,13 +1314,13 @@ def write_training_stats(
 
 
 def train(
-    env: environment.Environment,
+    env: environment.Environment | GymnaxWrapper,
     env_params: gym.EnvParams,
     agent: CDEAgent,
     args: PPOArguments,
     key: Key,
 ) -> CDEAgent:
-    env = wrappers.LogWrapper(env)  # pyright: ignore
+    env = wrappers.LogWrapper(env)
     writer = SummaryWriter(f"runs/{args.run_name}") if args.tb_logging else None
     if writer is not None:
         writer.add_text(
@@ -1395,16 +1399,65 @@ def train(
     return agent
 
 
+class TransformObservationWrapper(GymnaxWrapper):
+    def __init__(
+        self,
+        env: environment.Environment | GymnaxWrapper,
+        func: Callable[[Any, Any, Array | None], Array],
+        observation_space: spaces.Box | None = None,
+    ):
+        super().__init__(env)
+        self.func = func
+        self._observation_space = observation_space
+
+    def observation_space(self, params) -> spaces.Box:
+        if self._observation_space is not None:
+            return self._observation_space
+        else:
+            return self._env.observation_space(params)
+
+    def reset(self, key: Array, params: environment.EnvParams) -> tuple[Array, Any]:
+        env_key, wrapper_key = jr.split(key)
+        obs, state = self._env.reset(env_key, params)
+        return self.func(obs, params, wrapper_key), state
+
+    def step(
+        self, key: Array, state: Any, action: Array, params: environment.EnvParams
+    ) -> tuple[Array, Any, Array, Array, dict[Any, Any]]:
+        env_key, wrapper_key = jr.split(key)
+        obs, state, reward, done, info = self._env.step(env_key, state, action, params)
+        return self.func(obs, params, wrapper_key), state, reward, done, info
+
+
+class TransformRewardWrapper(GymnaxWrapper):
+    def __init__(
+        self,
+        env: environment.Environment | GymnaxWrapper,
+        func: Callable[[Any, Any, Array | None], Array],
+    ):
+        super().__init__(env)
+        self.func = func
+
+    def step(
+        self, key: Array, state: Any, action: Array, params: environment.EnvParams
+    ) -> tuple[Array, Any, Array, Array, dict[Any, Any]]:
+        env_key, wrapper_key = jr.split(key)
+        obs, state, reward, done, info = self._env.step(env_key, state, action, params)
+        reward = self.func(reward, params, wrapper_key)
+        return obs, state, reward, done, info
+
+
 if __name__ == "__main__":
     logger.setLevel(logging.INFO)
     key = jr.key(0)
     env, env_params = gym.make("Pendulum-v1")
 
-    agent = MLPAgent(
+    agent = CDEAgent(
         env=env,
         env_params=env_params,
+        hidden_size=4,
         width_size=64,
-        depth=2,
+        depth=1,
         key=key,
     )
 
@@ -1415,7 +1468,7 @@ if __name__ == "__main__":
     batch_size = num_minibatches // num_batches
 
     args = PPOArguments(
-        run_name="mlp-agent",
+        run_name="cde-agent",
         num_iterations=512,
         num_steps=num_steps,
         num_epochs=16,
