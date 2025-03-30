@@ -475,7 +475,7 @@ class CDEAgent(eqx.Module):
         cz0 = eqx.error_if(
             cz0, cz0.shape != (self.critic.state_size,), "cz0 has incorrect size"
         )
-        t1 = t1 or jnp.max(ts)
+        t1 = t1 or jnp.nanmax(ts)
 
         azs, action_mean = self.actor(ts, xs, z0=az0, t1=t1, evolving_out=evolving_out)
         czs, value = self.critic(ts, xs, z0=cz0, t1=t1, evolving_out=evolving_out)
@@ -737,7 +737,7 @@ class PPOArguments:
     num_batches: int = 8
     batch_size: int = 4
 
-    agent_timestep: float = 0.1
+    agent_timestep: float = 1.0
 
     gamma: float = 0.99
     gae_lambda: float = 0.95
