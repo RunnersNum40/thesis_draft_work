@@ -729,10 +729,10 @@ class PPOArguments:
 
     num_iterations: int
     num_steps: int = 2048
-    num_epochs: int = 16
-    num_minibatches: int = 32
-    minibatch_size: int = 64
-    num_batches: int = 8
+    num_epochs: int = 2
+    num_minibatches: int = 512
+    minibatch_size: int = 4
+    num_batches: int = 128
     batch_size: int = 4
 
     agent_timestep: float = 0.1
@@ -740,7 +740,7 @@ class PPOArguments:
     gamma: float = 0.99
     gae_lambda: float = 0.95
 
-    learning_rate: float = 3e-4
+    learning_rate: float = 5e-3
     anneal_learning_rate: bool = True
 
     normalize_advantage: bool = False
@@ -748,7 +748,7 @@ class PPOArguments:
     clip_value_loss: bool = True
     entropy_coefficient: float = 0.0
     value_coefficient: float = 0.5
-    max_gradient_norm: float = 0.5
+    max_gradient_norm: float = 1.0
     target_kl: float | None = None
 
     tb_logging: bool = True
@@ -1465,21 +1465,9 @@ if __name__ == "__main__":
         weight_scale=0.1,
     )
 
-    num_steps = 2048
-    minibatch_size = 16
-    num_minibatches = 2 * num_steps // minibatch_size
-    num_batches = 16
-    batch_size = 2 * num_minibatches // num_batches
-
     args = PPOArguments(
-        run_name="cde-agent-d2-ns2048",
+        run_name="cde-agent-tuned",
         num_iterations=1024,
-        num_steps=num_steps,
-        num_epochs=16,
-        num_minibatches=num_minibatches,
-        minibatch_size=minibatch_size,
-        num_batches=num_batches,
-        batch_size=batch_size,
         anneal_learning_rate=False,
     )
 
