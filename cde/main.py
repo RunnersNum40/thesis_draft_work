@@ -97,7 +97,6 @@ class Field(eqx.Module):
         out_shape: tuple[int, ...] | Literal["scalar"],
         *,
         key: Array,
-        weight_scale: float | None = 1.0,
         **kwargs,
     ) -> None:
         self.tensor_mlp = TensorMLP(
@@ -108,13 +107,6 @@ class Field(eqx.Module):
             key=key,
             **kwargs,
         )
-
-        if weight_scale is not None:
-            self.tensor_mlp = eqx.tree_at(
-                lambda tensor_mlp: tensor_mlp.mlp.layers[-1].weight,
-                self.tensor_mlp,
-                replace_fn=lambda x: jr.normal(key, x.shape) * weight_scale,
-            )
 
     def __call__(self, t: Array, x: Array, args) -> Array:
         """Time should be added as an extra dimension to the input instead of used here."""
@@ -144,7 +136,7 @@ class NeuralCDE(eqx.Module):
         output_width_size: int | None = None,
         output_depth: int | None = None,
         field_activation: Callable[[Array], Array] = jnn.tanh,
-        field_weight_scale: float = 1.0,
+        weight_scale: float = 1.0,
     ) -> None:
         """
         Neural Controlled Differential Equation model.
@@ -168,9 +160,9 @@ class NeuralCDE(eqx.Module):
         - output_depth: The number of hidden layers for the output.
             If None, defaults to 0 meaning a linear output.
         - field_activation: The activation function for the field.
-        - field_weight_scale: The scale of the weights for the field.
+        - weight_scale: The scale of the final layer wights for the model networks.
         """
-        ikey, fkey, okey = jr.split(key, 3)
+        initial_key, field_key, output_key = jr.split(key, 3)
 
         self.input_size = input_size
         self.state_size = hidden_size
@@ -187,7 +179,13 @@ class NeuralCDE(eqx.Module):
                 initial_width_size if initial_width_size is not None else width_size
             ),
             depth=initial_depth if initial_depth is not None else 0,
-            key=ikey,
+            key=initial_key,
+        )
+
+        self.initial = eqx.tree_at(
+            lambda mlp: mlp.layers[-1].weight,
+            self.initial,
+            replace_fn=lambda x: jr.normal(initial_key, x.shape) * weight_scale,
         )
 
         # Matrix output of hidden_size x (input_size + 1)
@@ -199,8 +197,13 @@ class NeuralCDE(eqx.Module):
             depth=depth,
             activation=field_activation,
             final_activation=jnn.tanh,
-            key=fkey,
-            weight_scale=field_weight_scale,
+            key=field_key,
+        )
+
+        self.field = eqx.tree_at(
+            lambda field: field.tensor_mlp.mlp.layers[-1].weight,
+            self.field,
+            replace_fn=lambda x: jr.normal(field_key, x.shape) * weight_scale,
         )
 
         # Default to a linear output
@@ -211,7 +214,13 @@ class NeuralCDE(eqx.Module):
                 output_width_size if output_width_size is not None else width_size
             ),
             depth=output_depth if output_depth is not None else depth,
-            key=okey,
+            key=output_key,
+        )
+
+        self.output = eqx.tree_at(
+            lambda mlp: mlp.layers[-1].weight,
+            self.output,
+            replace_fn=lambda x: jr.normal(output_key, x.shape) * weight_scale,
         )
 
     def __call__(
@@ -350,6 +359,7 @@ class CDEAgent(eqx.Module):
         critic_width_size: int | None = None,
         critic_depth: int | None = None,
         field_activation: Callable[[Array], Array] = jnn.softplus,
+        weight_scale: float = 0.1,
     ) -> None:
         """Create an actor critic model with a neural CDE.
 
@@ -372,6 +382,7 @@ class CDEAgent(eqx.Module):
         - critic_width_size: Width of the critic network.
         - critic_depth: Depth of the critic network.
         - field_activation: Activation function for the field in the neural CDE.
+        - weight_scale: Scale of the final layer weights for the model networks.
         """
         assert isinstance(env.action_space(env_params), spaces.Box)
         assert isinstance(env.observation_space(env_params), spaces.Box)
@@ -396,7 +407,7 @@ class CDEAgent(eqx.Module):
             output_depth=output_depth,
             key=actor_key,
             field_activation=field_activation,
-            field_weight_scale=0.1,
+            weight_scale=weight_scale,
         )
 
         self.actor = eqx.tree_at(
@@ -1181,6 +1192,9 @@ def epoch(
 def split_into_minibatches(
     rollout: RolloutBuffer, args: PPOArguments, key: Key
 ) -> RolloutBuffer:
+    """Split a rollout into contiguous minibatches that do not contain terminations
+    or truncations.
+    """
     dones = rollout.terminations | rollout.truncations
     possible_indices = jnp.arange(args.num_steps - args.minibatch_size + 1)
     valid_indices = jax.vmap(
@@ -1308,6 +1322,7 @@ def train(
     args: PPOArguments,
     key: Key,
 ) -> CDEAgent:
+    logger.info(f"Training {args.run_name} with {args.num_iterations} iterations")
     env = wrappers.LogWrapper(env)
     writer = SummaryWriter(f"runs/{args.run_name}") if args.tb_logging else None
     if writer is not None:
@@ -1436,28 +1451,29 @@ class TransformRewardWrapper(GymnaxWrapper):
 
 
 if __name__ == "__main__":
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.INFO)
     key = jr.key(0)
     env, env_params = gym.make("Pendulum-v1")
 
     agent = CDEAgent(
         env=env,
         env_params=env_params,
-        hidden_size=8,
-        width_size=128,
+        hidden_size=4,
+        width_size=64,
         depth=2,
         key=key,
+        weight_scale=0.1,
     )
 
     num_steps = 2048
-    minibatch_size = 8
-    num_minibatches = num_steps // minibatch_size
-    num_batches = 8
-    batch_size = num_minibatches // num_batches
+    minibatch_size = 16
+    num_minibatches = 2 * num_steps // minibatch_size
+    num_batches = 16
+    batch_size = 2 * num_minibatches // num_batches
 
     args = PPOArguments(
-        run_name="cde-agent",
-        num_iterations=512,
+        run_name="cde-agent-d2-ns2048",
+        num_iterations=1024,
         num_steps=num_steps,
         num_epochs=16,
         num_minibatches=num_minibatches,
@@ -1468,43 +1484,3 @@ if __name__ == "__main__":
     )
 
     agent = train(env, env_params, agent, args, key)
-
-# if __name__ == "__main__":
-#     key = jr.key(0)
-#     action_size = 2
-#     observation_size = 2
-#     num_steps = 1028
-#     num_minibatches = num_steps
-#     minibatch_size = num_steps // num_minibatches
-#     num_batches = 8
-#     batch_size = num_minibatches // num_batches
-#
-#     rollout = RolloutBuffer(
-#         observations=jnp.tile(jnp.arange(num_steps), (1, observation_size)),
-#         actions=jnp.tile(jnp.arange(num_steps), (1, action_size)),
-#         log_probs=jnp.arange(num_steps),
-#         entropies=jnp.arange(num_steps),
-#         values=jnp.arange(num_steps),
-#         rewards=jnp.arange(num_steps),
-#         terminations=jnp.full((num_steps,), False),
-#         truncations=jnp.full((num_steps,), False),
-#         advantages=jnp.arange(num_steps),
-#         returns=jnp.arange(num_steps),
-#         times=jnp.arange(num_steps),
-#     )
-#     rollout.terminations = rollout.terminations.at[num_steps // 2].set(True)
-#     args = PPOArguments(
-#         run_name="dummy",
-#         num_iterations=1,
-#         num_steps=num_steps,
-#         num_minibatches=num_minibatches,
-#         minibatch_size=minibatch_size,
-#         num_batches=num_batches,
-#         batch_size=batch_size,
-#     )
-#     rollout = minibatch_rollout(rollout, args, key)
-#
-#     print("Times:")
-#     print(rollout.times)
-#     for term in rollout.terminations:
-#         assert not term.any(), "Termination should be False"
