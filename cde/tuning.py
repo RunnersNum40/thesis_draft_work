@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import jax.random as jr
 import optuna
 import optunahub
+import joblib
 from jaxtyping import Key, Array
 
 from main import (
@@ -80,7 +81,7 @@ def evaluate(
 def objective(trial: optuna.Trial) -> float:
     key = jr.key(trial.number)
     env, env_params = gym.make("Pendulum-v1")
-    num_agents = 4
+    num_agents = 2
     total_steps = 524288
 
     weight_scale = trial.suggest_float("field_weight_scale", 0.1, 1.0, step=0.1)
@@ -118,6 +119,7 @@ def objective(trial: optuna.Trial) -> float:
 
     def test_agent(key: Key) -> Array:
         agent_key, train_key, eval_key = jr.split(key, 3)
+
         agent = CDEAgent(
             env=env,
             env_params=env_params,
@@ -127,7 +129,6 @@ def objective(trial: optuna.Trial) -> float:
             weight_scale=weight_scale,
             key=agent_key,
         )
-
         agent = train(env, env_params, agent, args, train_key)
         scores = evaluate(agent, env, env_params, args, eval_key)
 
@@ -141,14 +142,27 @@ def objective(trial: optuna.Trial) -> float:
 
 
 if __name__ == "__main__":
-    module = optunahub.load_module(package="samplers/auto_sampler")
-    study = optuna.create_study(
-        direction="maximize",
-        study_name="CDEAgent-exhaustive",
-        load_if_exists=True,
-        storage="sqlite:///cde_agent.db",
-        sampler=module.AutoSampler(),
+    n_workers = 8
+    n_trials = 64
+
+    def create_study() -> optuna.Study:
+        module = optunahub.load_module(package="samplers/auto_sampler")
+        study = optuna.create_study(
+            direction="maximize",
+            study_name="CDEAgent-exhaustive",
+            load_if_exists=True,
+            storage="sqlite:///cde_agent.db",
+            sampler=module.AutoSampler(),
+        )
+        return study
+
+    def optimize_study():
+        study = create_study()
+        study.optimize(objective, n_trials=n_trials // n_workers, n_jobs=1)
+
+    study = create_study()
+    joblib.Parallel(n_workers)(
+        joblib.delayed(optimize_study)() for _ in range(n_workers)
     )
-    study.optimize(objective, n_trials=64, n_jobs=8)
     print("Best trial:")
     print(study.best_params)
