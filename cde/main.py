@@ -280,7 +280,12 @@ class NeuralCDE(eqx.Module):
         term = diffrax.ControlTerm(self.field, control).to_ode()  # pyright: ignore
 
         solver = diffrax.Tsit5()
-        stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-6)
+        if isinstance(solver, diffrax.AbstractAdaptiveSolver):
+            dt0 = None
+            stepsize_controller = diffrax.PIDController(rtol=1e-3, atol=1e-6)
+        else:
+            dt0 = jnp.nanmin(ts[1:] - ts[:-1])
+            stepsize_controller = diffrax.ConstantStepSize()
 
         if evolving_out:
             t1 = jnp.max(ts)
@@ -295,7 +300,7 @@ class NeuralCDE(eqx.Module):
             solver=solver,
             t0=ts[0],
             t1=t1,
-            dt0=None,
+            dt0=dt0,
             y0=z0,
             stepsize_controller=stepsize_controller,
             saveat=saveat,
