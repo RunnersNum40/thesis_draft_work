@@ -1,2 +1,21 @@
+[project]
+name = "ncde-rl"
+version = "0.1.0"
+description = "Experiments with reinforcement learning using neural controlled differential equations"
+authors = [{ name = "Theodore Pinkerton", email = "p_t@fastmaiil.net" }]
+readme = "README.md"
+dependencies = ["jax"]
+requires-python = ">=3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = [
+  "jax",
+  "reinforcement learning",
+  "neural differential equations",
+  "node",
+  "neural controlled differential equations",
+  "ncde",
+]
+
 [tool.ruff.lint]
 ignore = ["F722"]
