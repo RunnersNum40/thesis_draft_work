@@ -19,6 +19,7 @@ import jax.random as jr
 import optax
 from gymnax import wrappers
 from gymnax.environments import environment, spaces
+from gymnax.visualize import Visualizer
 from gymnax.wrappers.purerl import GymnaxWrapper
 from jax import lax
 from jaxtyping import Array, ArrayLike, Bool, Float, Int, Key, PyTree
@@ -136,7 +137,6 @@ class NeuralCDE(eqx.Module):
         output_width_size: int | None = None,
         output_depth: int | None = None,
         field_activation: Callable[[Array], Array] = jnn.tanh,
-        weight_scale: float = 1.0,
     ) -> None:
         """
         Neural Controlled Differential Equation model.
@@ -182,12 +182,6 @@ class NeuralCDE(eqx.Module):
             key=initial_key,
         )
 
-        self.initial = eqx.tree_at(
-            lambda mlp: mlp.layers[-1].weight,
-            self.initial,
-            replace_fn=lambda x: jr.normal(initial_key, x.shape) * weight_scale,
-        )
-
         # Matrix output of hidden_size x (input_size + 1)
         # Tanh to prevent blowing up
         self.field = Field(
@@ -200,12 +194,6 @@ class NeuralCDE(eqx.Module):
             key=field_key,
         )
 
-        self.field = eqx.tree_at(
-            lambda field: field.tensor_mlp.mlp.layers[-1].weight,
-            self.field,
-            replace_fn=lambda x: jr.normal(field_key, x.shape) * weight_scale,
-        )
-
         # Default to a linear output
         self.output = eqx.nn.MLP(
             in_size=hidden_size,
@@ -214,13 +202,8 @@ class NeuralCDE(eqx.Module):
                 output_width_size if output_width_size is not None else width_size
             ),
             depth=output_depth if output_depth is not None else depth,
+            final_activation=jnn.tanh,
             key=output_key,
-        )
-
-        self.output = eqx.tree_at(
-            lambda mlp: mlp.layers[-1].weight,
-            self.output,
-            replace_fn=lambda x: jr.normal(output_key, x.shape) * weight_scale,
         )
 
     def __call__(
@@ -346,6 +329,8 @@ class CDEAgent(eqx.Module):
     action_std: Float[Array, " action_size"]
     critic: eqx.nn.MLP
 
+    action_space: spaces.Box
+
     def __init__(
         self,
         env: environment.Environment | GymnaxWrapper,
@@ -364,7 +349,6 @@ class CDEAgent(eqx.Module):
         critic_width_size: int | None = None,
         critic_depth: int | None = None,
         field_activation: Callable[[Array], Array] = jnn.softplus,
-        weight_scale: float = 0.1,
     ) -> None:
         """Create an actor critic model with a neural CDE.
 
@@ -387,7 +371,6 @@ class CDEAgent(eqx.Module):
         - critic_width_size: Width of the critic network.
         - critic_depth: Depth of the critic network.
         - field_activation: Activation function for the field in the neural CDE.
-        - weight_scale: Scale of the final layer weights for the model networks.
         """
         assert isinstance(env.action_space(env_params), spaces.Box)
         assert isinstance(env.observation_space(env_params), spaces.Box)
@@ -399,6 +382,8 @@ class CDEAgent(eqx.Module):
         )
         self.state_size = hidden_size
         self.action_size = int(jnp.asarray(env.action_space(env_params).shape).prod())
+
+        self.action_space = env.action_space(env_params)
 
         self.actor = NeuralCDE(
             input_size=self.input_size,
@@ -412,7 +397,6 @@ class CDEAgent(eqx.Module):
             output_depth=output_depth,
             key=actor_key,
             field_activation=field_activation,
-            weight_scale=weight_scale,
         )
 
         self.actor = eqx.tree_at(
@@ -483,13 +467,18 @@ class CDEAgent(eqx.Module):
         t1 = t1 or jnp.nanmax(ts)
 
         z1, action_mean = self.actor(ts, xs, z0=z0, t1=t1, evolving_out=evolving_out)
+        action_mean = (action_mean + 1) * (
+            self.action_space.high - self.action_space.low
+        ) / 2 + self.action_space.low
+
+        # action_std = jnp.exp(self.action_std)
+        action_std = jnp.ones_like(action_mean)
+
         if evolving_out:
             value = jax.vmap(self.critic)(xs)
         else:
             last_valid = jnp.sum(~jnp.isnan(ts)) - 1
             value = self.critic(xs[last_valid])
-
-        action_std = jnp.exp(self.action_std)
 
         if a1 is None:
             if key is not None:
@@ -640,7 +629,8 @@ class MLPAgent(eqx.Module):
             value = self.critic(xs[last_valid])
             z1 = jnp.zeros((self.state_size,))
 
-        action_std = jnp.exp(self.action_std)
+        # action_std = jnp.exp(self.action_std)
+        action_std = jnp.ones_like(action_mean)
 
         if a1 is None:
             if key is not None:
@@ -720,6 +710,7 @@ class PPOStats:
     policy_loss: Float[Array, " *N"]
     value_loss: Float[Array, " *N"]
     entropy_loss: Float[Array, " *N"]
+    state_loss: Float[Array, " *N"]
     approx_kl: Float[Array, " *N"]
     variance: Float[Array, " *N"]
     explained_variance: Float[Array, " *N"]
@@ -733,19 +724,19 @@ class PPOArguments:
     run_name: str
 
     num_iterations: int
-    num_steps: int = 2048
-    num_epochs: int = 2
-    num_minibatches: int = 512
-    minibatch_size: int = 4
-    num_batches: int = 128
+    num_steps: int = 1024
+    num_epochs: int = 16
+    num_minibatches: int = 32
+    minibatch_size: int = 32
+    num_batches: int = 8
     batch_size: int = 4
 
-    agent_timestep: float = 0.1
+    agent_timestep: float = 1.0
 
     gamma: float = 0.99
     gae_lambda: float = 0.95
 
-    learning_rate: float = 5e-3
+    learning_rate: float = 1e-3
     anneal_learning_rate: bool = True
 
     normalize_advantage: bool = False
@@ -753,7 +744,8 @@ class PPOArguments:
     clip_value_loss: bool = True
     entropy_coefficient: float = 0.0
     value_coefficient: float = 0.5
-    max_gradient_norm: float = 1.0
+    max_gradient_norm: float = 0.5
+    state_coefficient: float = 0.1
     target_kl: float | None = None
 
     tb_logging: bool = True
@@ -854,6 +846,8 @@ def env_step(
     args: PPOArguments,
     *,
     key: Key,
+    writer: SummaryWriter | None = None,
+    global_step: int | None = None,
 ) -> tuple[EpisodeState, RolloutBuffer, dict]:
     """Step the environment and agent forward one step and store the data in a rollout buffer.
 
@@ -872,7 +866,7 @@ def env_step(
     """
     actor_key, env_key, reset_key = jr.split(key, 3)
 
-    _, action, log_prob, entropy, value = agent.get_action_and_value(
+    z1, action, log_prob, entropy, value = agent.get_action_and_value(
         ts=episode_state.times,
         xs=episode_state.observations,
         key=actor_key,
@@ -888,6 +882,29 @@ def env_step(
     clipped_action = jnp.clip(
         action, env.action_space(env_params).low, env.action_space(env_params).high
     )
+
+    if writer is not None:
+        jax.debug.callback(
+            lambda action, global_step: writer.add_scalar(  # pyright: ignore
+                "episode/action", float(action), int(global_step)
+            ),
+            action[0],
+            global_step,
+        )
+        jax.debug.callback(
+            lambda action, global_step: writer.add_scalar(  # pyright: ignore
+                "episode/clipped_action", float(action), int(global_step)
+            ),
+            clipped_action[0],
+            global_step,
+        )
+        jax.debug.callback(
+            lambda z1, global_step: writer.add_scalar(  # pyright: ignore
+                "episode/z1", float(z1), int(global_step)
+            ),
+            jnp.linalg.norm(z1),
+            global_step,
+        )
     observation, env_state, reward, done, info = env.step(
         env_key, episode_state.env_state, clipped_action, env_params
     )
@@ -972,7 +989,14 @@ def collect_rollout(
             global_step=training_state.global_step + 1,
         )
         episode_state, buffer, info = env_step(
-            env, env_params, agent, episode_state, args, key=step_key
+            env,
+            env_params,
+            agent,
+            episode_state,
+            args,
+            key=step_key,
+            writer=writer,
+            global_step=training_state.global_step,
         )
 
         if writer is not None:
@@ -1027,7 +1051,7 @@ def minibatch_loss(
     returns: Float[Array, " minibatch_size"],
     args: PPOArguments,
 ) -> tuple[Float[Array, ""], PPOStats]:
-    _, _, new_log_probs, entropies, new_values = agent.get_action_and_value(
+    zs, _, new_log_probs, entropies, new_values = agent.get_action_and_value(
         ts=times, xs=observations, a1=actions, evolving_out=True
     )
 
@@ -1065,9 +1089,13 @@ def minibatch_loss(
         value_loss = jnp.mean(jnp.square(new_values - returns)) / 2
 
     entropy_loss = jnp.mean(entropies)
+
+    state_loss = jnp.mean(jnp.linalg.norm(zs, axis=-1))
+
     loss = (
         policy_loss
         + args.value_coefficient * value_loss
+        + args.state_coefficient * state_loss
         - args.entropy_coefficient * entropy_loss
     )
     stats = make_empty(
@@ -1076,6 +1104,7 @@ def minibatch_loss(
         policy_loss=policy_loss,
         value_loss=value_loss,
         entropy_loss=entropy_loss,
+        state_loss=state_loss,
         approx_kl=approx_kl,
     )
 
@@ -1304,6 +1333,8 @@ def write_training_stats(
     add_scalar(writer, "loss/value", stats.value_loss, global_step)
     log_callback(logger.debug, "entropy_loss", stats.entropy_loss)
     add_scalar(writer, "loss/entropy", stats.entropy_loss, global_step)
+    log_callback(logger.debug, "state_loss", stats.state_loss)
+    add_scalar(writer, "loss/state", stats.state_loss, global_step)
     log_callback(logger.debug, "learning_rate", stats.learning_rate)
     add_scalar(writer, "loss/learning_rate", stats.learning_rate, global_step)
     log_callback(logger.debug, "approx_kl", stats.approx_kl)
@@ -1455,6 +1486,95 @@ class TransformRewardWrapper(GymnaxWrapper):
         return obs, state, reward, done, info
 
 
+def run(
+    env: environment.Environment | GymnaxWrapper,
+    env_params: gym.EnvParams,
+    agent: CDEAgent,
+    args: PPOArguments,
+    *,
+    key: Key,
+) -> tuple[EpisodeState, RolloutBuffer]:
+    episode_state = reset_episode(env, env_params, args, key=key)
+
+    def scan_step(
+        carry: tuple[EpisodeState, Key],
+        _,
+    ) -> tuple[tuple[EpisodeState, Key], tuple[RolloutBuffer, EpisodeState]]:
+        episode_state, key = carry
+        carry_key, step_key = jr.split(key, 2)
+
+        episode_state, buffer, _ = env_step(
+            env, env_params, agent, episode_state, args, key=step_key
+        )
+
+        return (episode_state, carry_key), (buffer, episode_state)
+
+    (episode_state, _), (rollout, episode_states) = jax.lax.scan(
+        scan_step, (episode_state, key), length=args.num_steps
+    )
+    return episode_states, rollout
+
+
+def evaluate_episodes(
+    env: environment.Environment | GymnaxWrapper,
+    env_params: gym.EnvParams,
+    agent: CDEAgent,
+    args: PPOArguments,
+    num_episodes: int,
+    *,
+    key: Key,
+) -> Float[Array, ""]:
+    def episode_reward(key: Key):
+        _, rollout = run(env, env_params, agent, args, key=key)
+        episode_end = jnp.argmax(rollout.terminations | rollout.truncations)
+        episode_end = jnp.where(episode_end == 0, args.num_steps, episode_end)
+        mask = jnp.where(jnp.arange(args.num_steps) < episode_end, 1.0, 0.0)
+        return jnp.mean(rollout.rewards * mask)
+
+    return jnp.mean(jax.vmap(episode_reward)(jr.split(key, num_episodes)))
+
+
+def visualize_episode(
+    agent: CDEAgent,
+    num_steps: int,
+    *,
+    key: Key,
+):
+    import gymnasium as gym
+    import numpy as np
+
+    env = gym.make("Pendulum-v1", render_mode="human")
+    assert isinstance(env.observation_space, gym.spaces.Box)
+    assert isinstance(env.action_space, gym.spaces.Box)
+    observation, _ = env.reset()
+
+    observations = jnp.full((num_steps,) + env.observation_space.shape, jnp.nan)
+    observations = observations.at[0].set(jnp.asarray(observation))
+
+    times = jnp.full((num_steps,), jnp.nan)
+    times = times.at[0].set(0.0)
+
+    for step in range(num_steps):
+        _, action, _, _, _ = agent.get_action_and_value(
+            ts=times,
+            xs=observations,
+        )
+        clipped_action = jnp.clip(action, env.action_space.low, env.action_space.high)
+        observation, _, termination, truncation, _ = env.step(np.array(clipped_action))
+
+        observations = observations.at[step + 1].set(jnp.asarray(observation))
+        times = times.at[step + 1].set(times[step] + args.agent_timestep)
+
+        if termination or truncation:
+            observation, _ = env.reset()
+
+            observations = jnp.full((num_steps,) + env.observation_space.shape, jnp.nan)
+            observations = observations.at[0].set(jnp.asarray(observation))
+
+            times = jnp.full((args.num_steps,), jnp.nan)
+            times = times.at[0].set(0.0)
+
+
 if __name__ == "__main__":
     logger.setLevel(logging.INFO)
     key = jr.key(0)
@@ -1467,13 +1587,9 @@ if __name__ == "__main__":
         width_size=64,
         depth=2,
         key=key,
-        weight_scale=0.1,
     )
 
-    args = PPOArguments(
-        run_name="cde-agent-tuned",
-        num_iterations=1024,
-        anneal_learning_rate=False,
-    )
+    args = PPOArguments(run_name="cde-agent", num_iterations=1024)
 
     agent = train(env, env_params, agent, args, key)
+    visualize_episode(agent, 2000, key=key)
