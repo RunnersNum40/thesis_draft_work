@@ -84,7 +84,6 @@ def objective(trial: optuna.Trial) -> float:
     num_agents = 2
     total_steps = 524288
 
-    weight_scale = trial.suggest_float("field_weight_scale", 0.1, 1.0, step=0.1)
     agent_timestep = trial.suggest_float("agent_timestep", 1e-2, 1.0, step=1e-2)
     learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
     num_epochs = trial.suggest_int("num_epochs", 1, 32)
@@ -126,7 +125,6 @@ def objective(trial: optuna.Trial) -> float:
             hidden_size=4,
             width_size=64,
             depth=2,
-            weight_scale=weight_scale,
             key=agent_key,
         )
         agent = train(env, env_params, agent, args, train_key)
