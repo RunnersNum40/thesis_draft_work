@@ -4,7 +4,17 @@ version = "0.1.0"
 description = "Experiments with reinforcement learning using neural controlled differential equations"
 authors = [{ name = "Theodore Pinkerton", email = "p_t@fastmaiil.net" }]
 readme = "README.md"
-dependencies = ["jax"]
+dependencies = [
+  "jax",
+  "equinox",
+  "diffrax",
+  "optax",
+  "gymnax",
+  "gymnasium",
+  "jaxtyping",
+  "torch",
+  "chex",
+]
 requires-python = ">=3.13"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -15,7 +25,8 @@ keywords = [
   "node",
   "neural controlled differential equations",
   "ncde",
+  "diffrax",
 ]
 
 [tool.ruff.lint]
-ignore = ["F722"]
+ignore = ["F722"] # jax typing workaround

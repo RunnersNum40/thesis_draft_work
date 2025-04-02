@@ -19,7 +19,6 @@ import jax.random as jr
 import optax
 from gymnax import wrappers
 from gymnax.environments import environment, spaces
-from gymnax.visualize import Visualizer
 from gymnax.wrappers.purerl import GymnaxWrapper
 from jax import lax
 from jaxtyping import Array, ArrayLike, Bool, Float, Int, Key, PyTree

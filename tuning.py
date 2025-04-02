@@ -1,3 +1,4 @@
+import equinox as eqx
 import jax
 import jax.nn as jnn
 import jax.numpy as jnp
@@ -101,17 +102,22 @@ def objective(trial: optuna.Trial) -> float:
     # Batching
     total_steps = 524288
     num_steps = trial.suggest_categorical("num_steps", [1024, 2048, 4095])
-    num_minibatches = trial.suggest_categorical("minibatch_size", [4, 8, 16, 32, 64])
+    num_iterations = total_steps // num_steps
+    num_minibatches = trial.suggest_categorical("num_minibatches", [16, 32, 64])
     minibatch_size = num_steps // num_minibatches
     num_batches = trial.suggest_categorical("num_batches", [1, 2, 4, 8, 16])
     batch_size = num_minibatches // num_batches
+
+    assert minibatch_size > 0
+    assert batch_size > 0
+    assert batch_size <= num_minibatches
 
     key = jr.key(trial.number)
     env, env_params = gym.make("Pendulum-v1")
 
     args = PPOArguments(
         run_name=f"tune-{trial.number}",
-        num_iterations=total_steps // num_steps,
+        num_iterations=num_iterations,
         num_steps=num_steps,
         num_epochs=num_epochs,
         minibatch_size=minibatch_size,
@@ -145,15 +151,15 @@ def objective(trial: optuna.Trial) -> float:
         return jnp.mean(scores)
 
     try:
-        num_agents = 2
-        score = float(jnp.mean(jax.vmap(test_agent)(jr.split(key, num_agents))))
+        num_agents = 1
+        score = float(jnp.mean(eqx.filter_vmap(test_agent)(jr.split(key, num_agents))))
     except RuntimeError:
         score = float(jnp.nan)
     return score
 
 
 if __name__ == "__main__":
-    n_workers = 16
+    n_workers = 8
     n_trials = 128
 
     def create_study() -> optuna.Study:
@@ -162,7 +168,7 @@ if __name__ == "__main__":
             direction="maximize",
             study_name="CDEAgent-exhaustive",
             load_if_exists=True,
-            storage="sqlite:///cde_agent.db",
+            storage="sqlite:///tuning.db",
             sampler=module.AutoSampler(),
         )
         return study
@@ -175,5 +181,3 @@ if __name__ == "__main__":
     joblib.Parallel(n_workers)(
         joblib.delayed(optimize_study)() for _ in range(n_workers)
     )
-    print("Best trial:")
-    print(study.best_params)
