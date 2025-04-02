@@ -137,6 +137,7 @@ class NeuralCDE(eqx.Module):
         output_width_size: int | None = None,
         output_depth: int | None = None,
         field_activation: Callable[[Array], Array] = jnn.tanh,
+        output_final_activation: Callable[[Array], Array] = jnn.tanh,
     ) -> None:
         """
         Neural Controlled Differential Equation model.
@@ -160,7 +161,7 @@ class NeuralCDE(eqx.Module):
         - output_depth: The number of hidden layers for the output.
             If None, defaults to 0 meaning a linear output.
         - field_activation: The activation function for the field.
-        - weight_scale: The scale of the final layer wights for the model networks.
+        - output_final_activation: The activation function for the output.
         """
         initial_key, field_key, output_key = jr.split(key, 3)
 
@@ -202,7 +203,7 @@ class NeuralCDE(eqx.Module):
                 output_width_size if output_width_size is not None else width_size
             ),
             depth=output_depth if output_depth is not None else depth,
-            final_activation=jnn.tanh,
+            final_activation=output_final_activation,
             key=output_key,
         )
 
@@ -326,10 +327,11 @@ class CDEAgent(eqx.Module):
     state_size: int
     action_size: int
     actor: NeuralCDE
-    action_std: Float[Array, " action_size"]
+    action_logstd: Float[Array, " action_size"]
     critic: eqx.nn.MLP
 
     action_space: spaces.Box
+    const_std: bool
 
     def __init__(
         self,
@@ -349,6 +351,8 @@ class CDEAgent(eqx.Module):
         critic_width_size: int | None = None,
         critic_depth: int | None = None,
         field_activation: Callable[[Array], Array] = jnn.softplus,
+        actor_output_final_activation: Callable[[Array], Array] = jnn.tanh,
+        const_std: bool = False,
     ) -> None:
         """Create an actor critic model with a neural CDE.
 
@@ -371,6 +375,7 @@ class CDEAgent(eqx.Module):
         - critic_width_size: Width of the critic network.
         - critic_depth: Depth of the critic network.
         - field_activation: Activation function for the field in the neural CDE.
+        - const_std: Whether to use a constant standard deviation for the action.
         """
         assert isinstance(env.action_space(env_params), spaces.Box)
         assert isinstance(env.observation_space(env_params), spaces.Box)
@@ -397,6 +402,7 @@ class CDEAgent(eqx.Module):
             output_depth=output_depth,
             key=actor_key,
             field_activation=field_activation,
+            output_final_activation=actor_output_final_activation,
         )
 
         self.actor = eqx.tree_at(
@@ -405,7 +411,8 @@ class CDEAgent(eqx.Module):
             replace_fn=lambda x: jr.normal(actor_weight_key, x.shape) * 0.01,
         )
 
-        self.action_std = jnp.zeros(self.action_size)
+        self.action_logstd = jnp.zeros(self.action_size)
+        self.const_std = const_std
 
         self.critic = eqx.nn.MLP(
             in_size=self.input_size,
@@ -471,8 +478,10 @@ class CDEAgent(eqx.Module):
             self.action_space.high - self.action_space.low
         ) / 2 + self.action_space.low
 
-        # action_std = jnp.exp(self.action_std)
-        action_std = jnp.ones_like(action_mean)
+        if self.const_std:
+            action_std = jnp.ones_like(action_mean)
+        else:
+            action_std = jnp.exp(self.action_logstd)
 
         if evolving_out:
             value = jax.vmap(self.critic)(xs)
@@ -543,7 +552,7 @@ class MLPAgent(eqx.Module):
     state_size: int
     action_size: int
     actor: eqx.nn.MLP
-    action_std: Float[Array, " action_size"]
+    action_logstd: Float[Array, " action_size"]
     critic: eqx.nn.MLP
 
     def __init__(
@@ -584,7 +593,7 @@ class MLPAgent(eqx.Module):
             replace_fn=lambda x: jr.normal(actor_weight_key, x.shape) * 0.01,
         )
 
-        self.action_std = jnp.zeros(self.action_size)
+        self.action_logstd = jnp.zeros(self.action_size)
 
         self.critic = eqx.nn.MLP(
             in_size=self.input_size,

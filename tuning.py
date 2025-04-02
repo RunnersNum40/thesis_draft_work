@@ -1,10 +1,11 @@
 import jax
+import jax.nn as jnn
 import jax.numpy as jnp
 import jax.random as jr
+import joblib
 import optuna
 import optunahub
-import joblib
-from jaxtyping import Key, Array
+from jaxtyping import Array, Key
 
 from main import (
     CDEAgent,
@@ -31,11 +32,11 @@ def evaluate(
             step, episode_state, cum_reward, key, done_flag = carry
 
             def do_step():
-                action_key, step_key, carry_key = jr.split(key, 3)
+                step_key, carry_key = jr.split(key, 2)
+                # Deterministic actions
                 _, action, _, _, _ = agent.get_action_and_value(
                     ts=episode_state.times,
                     xs=episode_state.observations,
-                    key=action_key,
                 )
                 clipped_action = jnp.clip(
                     action,
@@ -79,24 +80,34 @@ def evaluate(
 
 
 def objective(trial: optuna.Trial) -> float:
-    key = jr.key(trial.number)
-    env, env_params = gym.make("Pendulum-v1")
-    num_agents = 2
-    total_steps = 524288
+    # Model parameters
+    hidden_size = 3
+    width_size = 64
+    depth = 2
+    actor_output_final_activation = {"tanh": jnn.tanh, "relu": jnn.relu}[
+        trial.suggest_categorical("actor_output_final_activation", ["tanh", "relu"])
+    ]
+    const_entropy = trial.suggest_categorical("const_entropy", [True, False])
 
-    agent_timestep = trial.suggest_float("agent_timestep", 1e-2, 1.0, step=1e-2)
+    # Gradient application
     learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
     num_epochs = trial.suggest_int("num_epochs", 1, 32)
-    clip_coefficient = trial.suggest_float("clip_coefficient", 0.1, 0.3, step=0.01)
-    entropy_coefficient = trial.suggest_float(
-        "entropy_coefficient", -0.05, 0.05, step=0.01
-    )
-    max_gradient_norm = trial.suggest_float("max_gradient_norm", 0.3, 1.0, step=0.01)
+
+    # Gradient calculation
+    clip_coefficient = trial.suggest_float("clip_coefficient", 0.1, 0.3)
+    state_coefficient = trial.suggest_float("state_coefficient", 0.0, 1.0)
+    max_gradient_norm = trial.suggest_float("max_gradient_norm", 0.0, 2.0)
+
+    # Batching
+    total_steps = 524288
     num_steps = trial.suggest_categorical("num_steps", [1024, 2048, 4095])
-    minibatch_size = trial.suggest_categorical("minibatch_size", [4, 8, 16, 32])
-    num_minibatches = num_steps // minibatch_size
-    num_batches = trial.suggest_categorical("batch_size", [4, 8, 16, 32])
+    num_minibatches = trial.suggest_categorical("minibatch_size", [4, 8, 16, 32, 64])
+    minibatch_size = num_steps // num_minibatches
+    num_batches = trial.suggest_categorical("num_batches", [1, 2, 4, 8, 16])
     batch_size = num_minibatches // num_batches
+
+    key = jr.key(trial.number)
+    env, env_params = gym.make("Pendulum-v1")
 
     args = PPOArguments(
         run_name=f"tune-{trial.number}",
@@ -109,9 +120,8 @@ def objective(trial: optuna.Trial) -> float:
         num_batches=num_batches,
         learning_rate=learning_rate,
         clip_coefficient=clip_coefficient,
-        entropy_coefficient=entropy_coefficient,
+        state_coefficient=state_coefficient,
         max_gradient_norm=max_gradient_norm,
-        agent_timestep=agent_timestep,
         anneal_learning_rate=False,
         tb_logging=False,
     )
@@ -122,10 +132,12 @@ def objective(trial: optuna.Trial) -> float:
         agent = CDEAgent(
             env=env,
             env_params=env_params,
-            hidden_size=4,
-            width_size=64,
-            depth=2,
+            hidden_size=hidden_size,
+            width_size=width_size,
+            depth=depth,
             key=agent_key,
+            const_std=const_entropy,
+            actor_output_final_activation=actor_output_final_activation,
         )
         agent = train(env, env_params, agent, args, train_key)
         scores = evaluate(agent, env, env_params, args, eval_key)
@@ -133,15 +145,16 @@ def objective(trial: optuna.Trial) -> float:
         return jnp.mean(scores)
 
     try:
+        num_agents = 2
         score = float(jnp.mean(jax.vmap(test_agent)(jr.split(key, num_agents))))
     except RuntimeError:
-        score = float(-jnp.inf)
+        score = float(jnp.nan)
     return score
 
 
 if __name__ == "__main__":
-    n_workers = 8
-    n_trials = 64
+    n_workers = 16
+    n_trials = 128
 
     def create_study() -> optuna.Study:
         module = optunahub.load_module(package="samplers/auto_sampler")
