@@ -21,9 +21,8 @@ class Args:
     cuda: bool = True
 
     env_id: str = "Pendulum-v1"
-    total_timesteps: int = 1000000
+    total_timesteps: int = 1048576
     learning_rate: float = 3e-4
-    num_envs: int = 1
     num_steps: int = 2048
     anneal_lr: bool = True
     gamma: float = 0.99
@@ -43,16 +42,6 @@ class Args:
     num_iterations: int = 0
 
 
-def make_env(env_id):
-    def thunk():
-        env = gym.make(env_id)
-        env = gym.wrappers.RecordEpisodeStatistics(env)
-        env = gym.wrappers.ClipAction(env)
-        return env
-
-    return thunk
-
-
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
@@ -60,30 +49,29 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 
 class Agent(nn.Module):
-    def __init__(self, envs):
+    def __init__(self, env: gym.Env):
+        assert isinstance(env.action_space, gym.spaces.Box)
+        assert isinstance(env.observation_space, gym.spaces.Box)
+
         super().__init__()
         self.critic = nn.Sequential(
-            layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
-            ),
+            layer_init(nn.Linear(np.array(env.observation_space.shape).prod(), 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 1), std=1.0),
         )
         self.actor_mean = nn.Sequential(
-            layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
-            ),
+            layer_init(nn.Linear(np.array(env.observation_space.shape).prod(), 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
             layer_init(
-                nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01
+                nn.Linear(64, int(np.asarray(env.action_space.shape).prod())), std=0.01
             ),
         )
         self.actor_logstd = nn.Parameter(
-            torch.zeros(1, np.prod(envs.single_action_space.shape))
+            torch.zeros(int(np.asarray(env.action_space.shape).prod()))
         )
 
     def get_value(self, x):
@@ -91,28 +79,37 @@ class Agent(nn.Module):
 
     def get_action_and_value(self, x, action=None):
         action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
+        action_std = torch.exp(self.actor_logstd)
         probs = Normal(action_mean, action_std)
+
         if action is None:
             action = probs.sample()
-        return (
-            action,
-            probs.log_prob(action).sum(1),
-            probs.entropy().sum(1),
-            self.critic(x),
-        )
+
+        if action.dim() == 1:
+            return (
+                action,
+                probs.log_prob(action).sum(),
+                probs.entropy().sum(),
+                self.critic(x),
+            )
+        else:
+            return (
+                action,
+                probs.log_prob(action).sum(1),
+                probs.entropy().sum(1),
+                self.critic(x),
+            )
 
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
-    args.batch_size = int(args.num_envs * args.num_steps)
+    args.batch_size = args.num_steps
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     print(f"Starting {run_name}")
 
-    writer = SummaryWriter(f"cde/runs/cleanrl")
+    writer = SummaryWriter("cde/runs/cleanrl")
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s"
@@ -128,37 +125,33 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
-    envs = gym.vector.SyncVectorEnv(
-        [make_env(args.env_id) for i in range(args.num_envs)]
-    )
+    env = gym.make(args.env_id, max_episode_steps=200)
+    env = gym.wrappers.RecordEpisodeStatistics(env)
+    env = gym.wrappers.ClipAction(env)
     assert isinstance(
-        envs.single_action_space, gym.spaces.Box
+        env.action_space, gym.spaces.Box
     ), "only continuous action space is supported"
     assert isinstance(
-        envs.single_observation_space, gym.spaces.Box
+        env.observation_space, gym.spaces.Box
     ), "only continuous observation space"
 
-    agent = Agent(envs).to(device)
+    agent = Agent(env).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
-    obs = torch.zeros(
-        (args.num_steps, args.num_envs) + envs.single_observation_space.shape
-    ).to(device)
-    actions = torch.zeros(
-        (args.num_steps, args.num_envs) + envs.single_action_space.shape
-    ).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    obs = torch.zeros((args.num_steps,) + env.observation_space.shape).to(device)
+    actions = torch.zeros((args.num_steps,) + env.action_space.shape).to(device)
+    logprobs = torch.zeros(args.num_steps).to(device)
+    rewards = torch.zeros(args.num_steps).to(device)
+    dones = torch.zeros(args.num_steps).to(device)
+    values = torch.zeros(args.num_steps).to(device)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
-    next_obs, _ = envs.reset(seed=args.seed)
-    next_obs = torch.Tensor(next_obs).to(device)
-    next_done = torch.zeros(args.num_envs).to(device)
+    next_observation, _ = env.reset(seed=args.seed)
+    next_observation = torch.tensor(next_observation).to(device)
+    next_done = torch.tensor(0).to(device)
 
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
@@ -168,41 +161,41 @@ if __name__ == "__main__":
             optimizer.param_groups[0]["lr"] = lrnow
 
         for step in range(0, args.num_steps):
-            global_step += args.num_envs
-            obs[step] = next_obs
+            global_step += 1
+            obs[step] = next_observation
             dones[step] = next_done
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
+                action, logprob, _, value = agent.get_action_and_value(next_observation)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
 
+            writer.add_scalar("episode/action", action.cpu().numpy()[0], global_step)
+
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, terminations, truncations, info = envs.step(
+            next_observation, reward, termination, truncation, info = env.step(
                 action.cpu().numpy()
             )
-            next_done = np.logical_or(terminations, truncations)
+            next_done = np.logical_or(termination, truncation)
             rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(
-                next_done
-            ).to(device)
+            next_observation, next_done = torch.tensor(next_observation).to(
+                device
+            ), torch.tensor(int(next_done)).to(device)
 
             if "episode" in info:
-                r = info["episode"]["r"]
-                l = info["episode"]["l"]
-                t = info["episode"]["t"]
-                done = info["_episode"]
+                writer.add_scalar("episode/reward", info["episode"]["r"], global_step)
+                writer.add_scalar("episode/length", info["episode"]["l"], global_step)
 
-                for ri, li, ti, di in zip(r, l, t, done):
-                    if di:
-                        writer.add_scalar("episode/reward", ri, global_step)
-                        writer.add_scalar("episode/length", li, global_step)
+            if termination or truncation:
+                next_observation, _ = env.reset()
+                next_observation = torch.tensor(next_observation).to(device)
+                next_done = torch.tensor(0).to(device)
 
         # bootstrap value if not done
         with torch.no_grad():
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            next_value = agent.get_value(next_observation).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
@@ -221,9 +214,9 @@ if __name__ == "__main__":
             returns = advantages + values
 
         # flatten the batch
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+        b_obs = obs.reshape((-1,) + env.observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        b_actions = actions.reshape((-1,) + env.action_space.shape)
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
@@ -305,5 +298,16 @@ if __name__ == "__main__":
         writer.add_scalar("stats/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("stats/explained_variance", explained_var, global_step)
 
-    envs.close()
+    env.close()
     writer.close()
+
+    env = gym.make(args.env_id, render_mode="human")
+    observation, _ = env.reset()
+    for step in range(2000):
+        action, _, _, _ = agent.get_action_and_value(
+            torch.tensor(observation).to(device)
+        )
+        observation, _, termination, truncation, _ = env.step(action.cpu().numpy())
+
+        if termination or truncation:
+            observation, _ = env.reset()
