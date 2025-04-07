@@ -336,6 +336,7 @@ class PPO[TObservation, TAction, TObservationSpace, TActionSpace](
         )
         opt_state = self.optimizer.init(eqx.filter(policy, eqx.is_inexact_array))
         self.learning_rate = learning_rate
+        # TODO: Support annealing
         self.anneal_learning_rate = anneal_learning_rate
 
         self.num_steps = num_steps
@@ -370,13 +371,16 @@ class PPO[TObservation, TAction, TObservationSpace, TActionSpace](
         self,
         state: eqx.nn.State,
         total_timesteps: int,
-        tb_log_name: str,
+        tb_log_name: str | None = None,
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
         *,
         key: Key,
     ) -> eqx.nn.State:
-        tb_writer = SummaryWriter(f"{self.tb_log_dir}/{tb_log_name}")
+        if tb_log_name is None:
+            tb_writer = None
+        else:
+            tb_writer = SummaryWriter(f"{self.tb_log_dir}/{tb_log_name}")
 
         if progress_bar:
             pbar = tqdm(total=total_timesteps, desc=f"Training: {tb_log_name}")
@@ -453,7 +457,12 @@ class PPO[TObservation, TAction, TObservationSpace, TActionSpace](
         raise NotImplementedError
 
     def collect_rollout(
-        self, num_steps: int, state: eqx.nn.State, *, key: Key, tb_writer: SummaryWriter
+        self,
+        num_steps: int,
+        state: eqx.nn.State,
+        *,
+        key: Key,
+        tb_writer: SummaryWriter | None,
     ) -> tuple[RolloutBuffer[TObservation, TAction], eqx.nn.State]:
         """Collect a rollout from the environment and policy.
 
@@ -571,7 +580,7 @@ class PPO[TObservation, TAction, TObservationSpace, TActionSpace](
         rollout_buffer: RolloutBuffer[TObservation, TAction],
         state: eqx.nn.State,
         *,
-        tb_writer: SummaryWriter,
+        tb_writer: SummaryWriter | None,
         key: Key,
     ) -> eqx.nn.State:
         """Train the policy using a collected rollout buffer."""
@@ -698,16 +707,17 @@ class PPO[TObservation, TAction, TObservationSpace, TActionSpace](
             rollout_buffer.returns - rollout_buffer.values
         ) / (variance + jnp.finfo(variance.dtype).eps)
 
-        tb_log = debug_wrapper(tb_writer.add_scalar, ordered=True)
-        tb_log("loss/total", stats[0], global_step)
-        tb_log("loss/policy", stats[1], global_step)
-        tb_log("loss/value", stats[2], global_step)
-        tb_log("loss/state", stats[3], global_step)
-        tb_log("loss/entropy", stats[4], global_step)
-        tb_log("loss/approx_kl", stats[5], global_step)
-        tb_log("loss/learning_rate", learning_rate, global_step)
-        tb_log("stats/variance", variance, global_step)
-        tb_log("stats/explained_variance", explained_variance, global_step)
+        if tb_writer is not None:
+            tb_log = debug_wrapper(tb_writer.add_scalar, ordered=True)
+            tb_log("loss/total", stats[0], global_step)
+            tb_log("loss/policy", stats[1], global_step)
+            tb_log("loss/value", stats[2], global_step)
+            tb_log("loss/state", stats[3], global_step)
+            tb_log("loss/entropy", stats[4], global_step)
+            tb_log("loss/approx_kl", stats[5], global_step)
+            tb_log("loss/learning_rate", learning_rate, global_step)
+            tb_log("stats/variance", variance, global_step)
+            tb_log("stats/explained_variance", explained_variance, global_step)
 
         return state
 

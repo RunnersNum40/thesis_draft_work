@@ -204,7 +204,7 @@ class NeuralCDE(eqx.Module):
     field: AbstractTensorVectorField
     output_network: eqx.nn.MLP
 
-    solver: ClassVar[type[diffrax.AbstractSolver]] = diffrax.Tsit5
+    solver: ClassVar[type[diffrax.AbstractSolver]] = diffrax.Heun
 
     def __init__(
         self,
@@ -227,7 +227,7 @@ class NeuralCDE(eqx.Module):
         initial_activation: Callable[[Array], Array] = jnn.relu,
         initial_final_activation: Callable[[Array], Array] = lambda x: x,
         output_activation: Callable[[Array], Array] = jnn.relu,
-        output_final_activation: Callable[[Array], Array] = jnn.tanh,
+        output_final_activation: Callable[[Array], Array] = jnn.relu,
     ) -> None:
         self.max_steps = max_steps
 

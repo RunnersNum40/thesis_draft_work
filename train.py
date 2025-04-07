@@ -17,7 +17,7 @@ def main():
     env = wrappers.AddTimeWrapper(env)
 
     learning_rate = 1e-4
-    num_steps = 1024
+    num_steps = 2048
     num_epochs = 8
     num_minibatches = 32
     total_timesteps = 1048576
@@ -33,7 +33,7 @@ def main():
             "depth": depth,
             "state_size": 4,
             "num_features": 4,
-            "max_steps": 16,
+            "max_steps": 4,
         },
         env=env,
         env_params=env_params,
@@ -48,7 +48,7 @@ def main():
     state = ppo_agent.learn(
         state,
         total_timesteps=total_timesteps,
-        tb_log_name=f"{env_id}_ncde",
+        # tb_log_name=f"{env_id}_ncde_heun",
         key=key,
         progress_bar=True,
     )

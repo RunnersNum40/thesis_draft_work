@@ -1,161 +1,132 @@
 import equinox as eqx
 import jax
 import jax.nn as jnn
+from jax import lax
 import jax.numpy as jnp
 import jax.random as jr
 import joblib
 import optuna
 import optunahub
-from jaxtyping import Array, Key
+from jaxtyping import Array, Key, Float
 
-from main import (
-    CDEAgent,
-    PPOArguments,
-    gym,
-    reset_episode,
-    train,
-)
+from ppo import PPO, Env, gym
+import wrappers
+from policies import SharedNeuralCDEActorCriticPolicy
 
 
 def evaluate(
-    agent: CDEAgent,
-    env,
-    env_params,
-    args: PPOArguments,
+    policy: PPO,
+    state: eqx.nn.State,
+    env: Env,
+    env_params: gym.EnvParams,
     key: Key,
     num_eval_episodes: int = 5,
-) -> Array:
-    def run_episode(key: Key):
-        key, reset_key = jr.split(key)
-        episode_state = reset_episode(env, env_params, args, key=reset_key)
-
+    max_episode_length: int = 500,
+) -> Float[Array, ""]:
+    def run_episode(key: Key) -> Float[Array, ""]:
         def step_fn(carry, _):
-            step, episode_state, cum_reward, key, done_flag = carry
+            env_state, policy_state, obs, done, total_reward, step_key = carry
 
-            def do_step():
-                step_key, carry_key = jr.split(key, 2)
-                # Deterministic actions
-                _, action, _, _, _ = agent.get_action_and_value(
-                    ts=episode_state.times,
-                    xs=episode_state.observations,
-                )
-                clipped_action = jnp.clip(
-                    action,
-                    env.action_space(env_params).low,
-                    env.action_space(env_params).high,
-                )
-                obs, new_env_state, reward, done, _ = env.step(
-                    step_key, episode_state.env_state, clipped_action, env_params
-                )
-                new_episode_state = episode_state.replace(
-                    step=episode_state.step + 1,
-                    env_state=new_env_state,
-                    observations=episode_state.observations.at[
-                        episode_state.step + 1
-                    ].set(obs),
-                    times=episode_state.times.at[episode_state.step + 1].set(
-                        episode_state.times[episode_state.step] + args.agent_timestep
-                    ),
-                )
-                return (
-                    step + 1,
-                    new_episode_state,
-                    cum_reward + reward,
-                    carry_key,
-                    done,
-                )
+            step_key, carry_key = jr.split(step_key)
 
-            new_carry = jax.lax.cond(
-                done_flag,
-                lambda: (step, episode_state, cum_reward, key, done_flag),
-                do_step,
+            action, policy_state = policy.policy(state).predict_action(
+                obs, policy_state
             )
-            return new_carry, None
+            obs, env_state, reward, done_step, _ = env.step(
+                step_key, env_state, action, env_params
+            )
 
-        init_carry = (0, episode_state, 0.0, key, False)
-        final_carry, _ = jax.lax.scan(step_fn, init_carry, jnp.arange(args.num_steps))
-        return final_carry[2]
+            total_reward += reward
+            done = jnp.logical_or(done, done_step)
 
-    rewards = jax.vmap(run_episode)(jr.split(key, num_eval_episodes))
+            return (env_state, policy_state, obs, done, total_reward, carry_key), done
+
+        reset_key, step_key = jr.split(key)
+        obs, env_state = env.reset(reset_key, env_params)
+        policy_state = policy.policy(state).reset(
+            env_state, env_params, eqx.nn.State({})
+        )
+        total_reward = jnp.array(0.0)
+        done = jnp.array(False)
+
+        (env_state, policy_state, obs, done, total_reward, _), _ = lax.scan(
+            step_fn,
+            (env_state, policy_state, obs, done, total_reward, step_key),
+            None,
+            length=max_episode_length,
+        )
+
+        return total_reward
+
+    episode_keys = jr.split(key, num_eval_episodes)
+    rewards = jax.vmap(run_episode)(episode_keys)
     return jnp.mean(rewards)
 
 
 def objective(trial: optuna.Trial) -> float:
-    # Model parameters
-    hidden_size = 3
-    width_size = 64
-    depth = 2
-    actor_output_final_activation = {"tanh": jnn.tanh, "relu": jnn.relu}[
-        trial.suggest_categorical("actor_output_final_activation", ["tanh", "relu"])
-    ]
-    const_entropy = trial.suggest_categorical("const_entropy", [True, False])
-
-    # Gradient application
-    learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
-    num_epochs = trial.suggest_int("num_epochs", 1, 32)
-
-    # Gradient calculation
-    clip_coefficient = trial.suggest_float("clip_coefficient", 0.1, 0.3)
-    state_coefficient = trial.suggest_float("state_coefficient", 0.0, 1.0)
-    max_gradient_norm = trial.suggest_float("max_gradient_norm", 0.0, 2.0)
-
-    # Batching
-    total_steps = 524288
-    num_steps = trial.suggest_categorical("num_steps", [1024, 2048, 4095])
-    num_iterations = total_steps // num_steps
-    num_minibatches = trial.suggest_categorical("num_minibatches", [16, 32, 64])
-    minibatch_size = num_steps // num_minibatches
-    num_batches = trial.suggest_categorical("num_batches", [1, 2, 4, 8, 16])
-    batch_size = num_minibatches // num_batches
-
-    assert minibatch_size > 0
-    assert batch_size > 0
-    assert batch_size <= num_minibatches
-
     key = jr.key(trial.number)
-    env, env_params = gym.make("Pendulum-v1")
 
-    args = PPOArguments(
-        run_name=f"tune-{trial.number}",
-        num_iterations=num_iterations,
+    # Hyperparameters
+    learning_rate = trial.suggest_float("learning_rate", 1e-5, 1e-3, log=True)
+    num_steps = trial.suggest_int("num_steps", 1024, 8192, step=1024)
+    num_epochs = trial.suggest_int("num_epochs", 1, 10)
+    num_minibatches = trial.suggest_int("num_minibatches", 1, 64)
+
+    clip_coefficient = trial.suggest_float("clip_coefficient", 0.1, 0.3)
+    entropy_coefficient = trial.suggest_float("entropy_coefficient", 0.0, 0.02)
+    value_coefficient = trial.suggest_float("value_coefficient", 0.25, 1.0)
+    state_coefficient = trial.suggest_float("state_coefficient", 0.0, 1.0)
+
+    # Model architecture
+    width_size = trial.suggest_categorical("width_size", [32, 64, 128, 256])
+    depth = trial.suggest_int("depth", 1, 4)
+    state_size = trial.suggest_categorical("state_size", [8, 16, 32, 64])
+    num_features = trial.suggest_categorical("num_features", [4, 8, 16, 32])
+    max_steps = trial.suggest_int("max_steps", 2, 64, log=True)
+
+    env_id = "Pendulum-v1"
+    env, env_params = gym.make(env_id)
+    env = wrappers.ClipActionWrapper(env)
+    env = wrappers.RescaleAction(env)
+    env = wrappers.AddTimeWrapper(env)
+
+    ppo_agent, state = eqx.nn.make_with_state(PPO)(
+        policy_class=SharedNeuralCDEActorCriticPolicy,
+        policy_args=(),
+        policy_kwargs={
+            "width_size": width_size,
+            "depth": depth,
+            "state_size": state_size,
+            "num_features": num_features,
+            "max_steps": max_steps,
+        },
+        env=env,
+        env_params=env_params,
+        learning_rate=learning_rate,
+        anneal_learning_rate=True,
         num_steps=num_steps,
         num_epochs=num_epochs,
-        minibatch_size=minibatch_size,
         num_minibatches=num_minibatches,
-        batch_size=batch_size,
-        num_batches=num_batches,
-        learning_rate=learning_rate,
         clip_coefficient=clip_coefficient,
+        entropy_coefficient=entropy_coefficient,
+        value_coefficient=value_coefficient,
         state_coefficient=state_coefficient,
-        max_gradient_norm=max_gradient_norm,
-        anneal_learning_rate=False,
-        tb_logging=False,
+        key=key,
     )
 
-    def test_agent(key: Key) -> Array:
-        agent_key, train_key, eval_key = jr.split(key, 3)
+    total_timesteps = 524288
+    state = ppo_agent.learn(
+        state,
+        total_timesteps=total_timesteps,
+        key=key,
+    )
 
-        agent = CDEAgent(
-            env=env,
-            env_params=env_params,
-            hidden_size=hidden_size,
-            width_size=width_size,
-            depth=depth,
-            key=agent_key,
-            const_std=const_entropy,
-            actor_output_final_activation=actor_output_final_activation,
-        )
-        agent = train(env, env_params, agent, args, train_key)
-        scores = evaluate(agent, env, env_params, args, eval_key)
+    eval_key = jr.split(key)[0]
+    avg_reward = evaluate(
+        ppo_agent, state, env, env_params, eval_key, num_eval_episodes=5
+    )
 
-        return jnp.mean(scores)
-
-    try:
-        num_agents = 1
-        score = float(jnp.mean(eqx.filter_vmap(test_agent)(jr.split(key, num_agents))))
-    except RuntimeError:
-        score = float(jnp.nan)
-    return score
+    return float(avg_reward)
 
 
 if __name__ == "__main__":

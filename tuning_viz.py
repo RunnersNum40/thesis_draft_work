@@ -1,15 +1,11 @@
 import optuna
 import optuna.visualization as vis
-import optunahub
 
 if __name__ == "__main__":
-    module = optunahub.load_module(package="samplers/auto_sampler")
     study = optuna.create_study(
-        direction="maximize",
         study_name="CDEAgent-exhaustive",
         load_if_exists=True,
         storage="sqlite:///cde_agent.db",
-        sampler=module.AutoSampler(),
     )
 
     importances = optuna.importance.get_param_importances(study)
