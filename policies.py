@@ -3,7 +3,6 @@ from typing import Callable, TypeVar
 
 import equinox as eqx
 import gymnax as gym
-import jax
 from distreqx import distributions
 from gymnax.environments import spaces
 from jax import nn as jnn
@@ -148,10 +147,18 @@ def flatten_sample(
         )
 
     if isinstance(space, spaces.Dict):
-        # TODO: Debug this
-        return jnp.concatenate(
-            [flatten_sample(sample[k], space.spaces[k]) for k in sample.keys()]
-        )
+        if "time" in sample:
+            time = jnp.expand_dims(jnp.array(sample["time"]), axis=-1) / 1000.0
+            return jnp.concatenate(
+                [
+                    time,
+                    flatten_sample(sample["observation"], space.spaces["observation"]),
+                ]
+            )
+        else:
+            return jnp.concatenate(
+                [flatten_sample(sample[k], space.spaces[k]) for k in sample.keys()]
+            )
 
     raise ValueError(f"Cannot flatten {space}.")
 
@@ -688,7 +695,7 @@ class CDEActorMLPCriticPolicy(
         self, observation: PyTree[Array], state: eqx.nn.State
     ) -> tuple[tuple[Float[Array, ""], Float[Array, " n"]], eqx.nn.State]:
         """Extract features from the observation."""
-        time = observation["time"]
+        time = observation["time"] * 1e-3
         flattened = flatten_sample(
             observation["observation"], self.observation_space.spaces["observation"]
         )
@@ -731,16 +738,3 @@ class CDEActorMLPCriticPolicy(
 
     def get_hidden_state(self, state: eqx.nn.State) -> Float[Array, " state_size"]:
         return self.actor.z1(state)
-
-
-if __name__ == "__main__":
-    key = jr.key(0)
-    env, env_params = gym.make("Pendulum-v1")
-
-    policy, state = eqx.nn.make_with_state(MLPActorMLPCriticPolicy)(
-        env,
-        env_params,
-        width_size=64,
-        depth=2,
-        key=key,
-    )

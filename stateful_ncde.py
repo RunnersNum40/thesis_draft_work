@@ -153,7 +153,7 @@ class MLPTensorVectorField(AbstractTensorVectorField, strict=True):
         self.state_size = state_size
 
         self.mlp = TensorMLP(
-            in_shape=(state_size + 1,),  # Add time
+            in_shape=(state_size,),
             out_shape=(state_size, input_size + 1),
             width_size=width_size,
             depth=depth,
@@ -168,8 +168,7 @@ class MLPTensorVectorField(AbstractTensorVectorField, strict=True):
     def __call__(
         self, t: ScalarLike, z: Float[Array, " state_size"], args: PyTree
     ) -> Float[Array, " state_size input_size"]:
-        input = jnp.concatenate([jnp.expand_dims(t, axis=-1), z])
-        return self.mlp(input)
+        return self.mlp(z)
 
 
 class NeuralCDE(eqx.Module):
@@ -204,7 +203,7 @@ class NeuralCDE(eqx.Module):
     field: AbstractTensorVectorField
     output_network: eqx.nn.MLP
 
-    solver: ClassVar[type[diffrax.AbstractSolver]] = diffrax.Heun
+    solver: ClassVar[type[diffrax.AbstractSolver]] = diffrax.Tsit5
 
     def __init__(
         self,

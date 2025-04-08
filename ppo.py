@@ -277,6 +277,7 @@ class PPO[TFeatures, TObservation, TAction, TObservationSpace, TActionSpace](
     num_epochs: int
     num_minibatches: int
 
+    total_timesteps: int
     num_steps: int
     gamma: float
     gae_lambda: float
@@ -286,7 +287,7 @@ class PPO[TFeatures, TObservation, TAction, TObservationSpace, TActionSpace](
     entropy_coefficient: float
     value_coefficient: float
     state_coefficient: float
-    max_grad_norm: float
+    max_gradient_norm: float
 
     tb_log_dir: str
 
@@ -303,6 +304,7 @@ class PPO[TFeatures, TObservation, TAction, TObservationSpace, TActionSpace](
         env_params: gym.EnvParams,
         learning_rate: float,
         anneal_learning_rate: bool,
+        total_timesteps: int,
         num_steps: int,
         num_epochs: int,
         num_minibatches: int,
@@ -338,18 +340,23 @@ class PPO[TFeatures, TObservation, TAction, TObservationSpace, TActionSpace](
         self.observation_space = env.observation_space(env_params)
         self.action_space = env.action_space(env_params)
 
-        adam = optax.inject_hyperparams(optax.adam)(
-            learning_rate=learning_rate, eps=1e-5
-        )
+        if anneal_learning_rate:
+            schedule = optax.cosine_decay_schedule(
+                learning_rate,
+                total_timesteps * num_epochs * num_minibatches // num_steps,
+            )
+        else:
+            schedule = optax.constant_schedule(learning_rate)
+        adam = optax.inject_hyperparams(optax.adam)(learning_rate=schedule, eps=1e-5)
         self.optimizer = optax.named_chain(
             ("clipping", optax.clip_by_global_norm(max_gradient_norm)),
             ("adam", adam),
         )
         opt_state = self.optimizer.init(eqx.filter(policy, eqx.is_inexact_array))
         self.learning_rate = learning_rate
-        # TODO: Support annealing
         self.anneal_learning_rate = anneal_learning_rate
 
+        self.total_timesteps = total_timesteps
         self.num_steps = num_steps
         self.num_epochs = num_epochs
         self.num_minibatches = num_minibatches
@@ -362,7 +369,7 @@ class PPO[TFeatures, TObservation, TAction, TObservationSpace, TActionSpace](
         self.entropy_coefficient = entropy_coefficient
         self.value_coefficient = value_coefficient
         self.state_coefficient = state_coefficient
-        self.max_grad_norm = max_gradient_norm
+        self.max_gradient_norm = max_gradient_norm
 
         self.tb_log_dir = tb_log_dir
 
@@ -381,7 +388,6 @@ class PPO[TFeatures, TObservation, TAction, TObservationSpace, TActionSpace](
     def learn(
         self,
         state: eqx.nn.State,
-        total_timesteps: int,
         tb_log_name: str | None = None,
         reset_num_timesteps: bool = True,
         progress_bar: bool = False,
@@ -394,7 +400,7 @@ class PPO[TFeatures, TObservation, TAction, TObservationSpace, TActionSpace](
             tb_writer = SummaryWriter(f"{self.tb_log_dir}/{tb_log_name}")
 
         if progress_bar:
-            pbar = tqdm(total=total_timesteps, desc=f"Training: {tb_log_name}")
+            pbar = tqdm(total=self.total_timesteps, desc=f"Training: {tb_log_name}")
             pbar_update = debug_wrapper(pbar.update)
 
         # Reset the global step to 0 if reset_num_timesteps is True
@@ -445,7 +451,7 @@ class PPO[TFeatures, TObservation, TAction, TObservationSpace, TActionSpace](
                 state, _ = val
                 global_step = state.get(self.state_index)[5]
 
-                return jnp.asarray(global_step) < jnp.asarray(total_timesteps)
+                return jnp.asarray(global_step) < jnp.asarray(self.total_timesteps)
 
             state, _ = lax.while_loop(cond, step, (state, key))
 
