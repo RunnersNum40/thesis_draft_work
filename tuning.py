@@ -11,7 +11,7 @@ from jaxtyping import Array, Key, Float
 
 from ppo import PPO, Env, gym
 import wrappers
-from policies import SharedNeuralCDEActorCriticPolicy
+from policies import SharedCDEPolicy
 
 
 def evaluate(
@@ -91,7 +91,7 @@ def objective(trial: optuna.Trial) -> float:
     env = wrappers.AddTimeWrapper(env)
 
     ppo_agent, state = eqx.nn.make_with_state(PPO)(
-        policy_class=SharedNeuralCDEActorCriticPolicy,
+        policy_class=SharedCDEPolicy,
         policy_args=(),
         policy_kwargs={
             "width_size": width_size,
@@ -114,7 +114,7 @@ def objective(trial: optuna.Trial) -> float:
         key=key,
     )
 
-    total_timesteps = 524288
+    total_timesteps = 8192
     state = ppo_agent.learn(
         state,
         total_timesteps=total_timesteps,
@@ -130,8 +130,8 @@ def objective(trial: optuna.Trial) -> float:
 
 
 if __name__ == "__main__":
-    n_workers = 8
-    n_trials = 128
+    n_workers = 16
+    n_trials = 256
 
     def create_study() -> optuna.Study:
         module = optunahub.load_module(package="samplers/auto_sampler")

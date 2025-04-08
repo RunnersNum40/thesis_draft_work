@@ -13,7 +13,7 @@ from jax import numpy as jnp
 from jax import random as jr
 from jaxtyping import Array, ArrayLike, Bool, Float, Int, Key, PyTree
 from torch.utils.tensorboard.writer import SummaryWriter
-from tqdm import tqdm
+from tqdm.rich import tqdm
 
 from buffers import RolloutBuffer, batches, compute_returns_and_advantages
 from policies import AbstractActorCriticPolicy
@@ -66,6 +66,15 @@ def debug_wrapper(
     return wrapped
 
 
+def clone_state(state: eqx.nn.State) -> eqx.nn.State:
+    """Clone the state."""
+    leaves, treedef = jax.tree.flatten(state)
+    state_clone = jax.tree.unflatten(treedef, leaves)
+    return state_clone
+
+
+TFeatures = TypeVar("TFeatures", bound=PyTree[Array])
+
 TObservation = TypeVar("TObservation", bound=PyTree[Array])
 TAction = TypeVar("TAction", bound=PyTree[Array])
 
@@ -78,7 +87,7 @@ def step_env(
     env_params: gym.EnvParams,
     env_state: gym.EnvState,
     policy: AbstractActorCriticPolicy[
-        TObservation, TAction, TObservationSpace, TActionSpace
+        TFeatures, TObservation, TAction, TObservationSpace, TActionSpace
     ],
     last_policy_state: eqx.nn.State,
     last_observation: TObservation,
@@ -98,7 +107,7 @@ def step_env(
     action_key, env_step_key, reset_key = jr.split(key, 3)
 
     action, value, log_prob, policy_state = policy(
-        last_observation, last_policy_state, key=action_key
+        last_observation, clone_state(last_policy_state), key=action_key
     )
 
     observation, env_state, reward, done, info = env.step(
@@ -125,7 +134,9 @@ def step_env(
     def reset() -> tuple[gym.EnvState, eqx.nn.State, PyTree[Array]]:
         """Reset the environment and policy state."""
         observation, env_state = env.reset(reset_key, env_params)
-        new_policy_state = policy.reset(env_state, env_params, policy_state)
+        new_policy_state = policy.reset(
+            env_state, env_params, clone_state(policy_state)
+        )
 
         env_state = fix_env_state(env_state)
 
@@ -162,7 +173,7 @@ def step_env(
 
 def ppo_loss(
     policy: AbstractActorCriticPolicy[
-        TObservation, TAction, TObservationSpace, TActionSpace
+        TFeatures, TObservation, TAction, TObservationSpace, TActionSpace
     ],
     rollout_buffer: RolloutBuffer[TObservation, TAction],
     normalize_advantage: bool,
@@ -237,7 +248,7 @@ def ppo_loss(
 ppo_loss_grad = eqx.filter_value_and_grad(ppo_loss, has_aux=True)
 
 
-class PPO[TObservation, TAction, TObservationSpace, TActionSpace](
+class PPO[TFeatures, TObservation, TAction, TObservationSpace, TActionSpace](
     eqx.Module, strict=True
 ):
     state_index: eqx.nn.StateIndex[
@@ -283,7 +294,7 @@ class PPO[TObservation, TAction, TObservationSpace, TActionSpace](
         self,
         policy_class: type[
             AbstractActorCriticPolicy[
-                TObservation, TAction, TObservationSpace, TActionSpace
+                TFeatures, TObservation, TAction, TObservationSpace, TActionSpace
             ]
         ],
         policy_args: tuple,
@@ -480,7 +491,7 @@ class PPO[TObservation, TAction, TObservationSpace, TActionSpace](
         ) = state.get(self.state_index)
 
         policy: AbstractActorCriticPolicy[
-            TObservation, TAction, TObservationSpace, TActionSpace
+            TFeatures, TObservation, TAction, TObservationSpace, TActionSpace
         ] = eqx.combine(policy_dynamic, self.policy_static)
 
         def scan_step(
@@ -626,7 +637,7 @@ class PPO[TObservation, TAction, TObservationSpace, TActionSpace](
                 policy_dynamic, opt_state = carry
 
                 policy: AbstractActorCriticPolicy[
-                    TObservation, TAction, TObservationSpace, TActionSpace
+                    TFeatures, TObservation, TAction, TObservationSpace, TActionSpace
                 ] = eqx.combine(policy_dynamic, self.policy_static)
 
                 (_, stats), grads = ppo_loss_grad(

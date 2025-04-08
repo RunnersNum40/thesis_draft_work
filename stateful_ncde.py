@@ -227,7 +227,7 @@ class NeuralCDE(eqx.Module):
         initial_activation: Callable[[Array], Array] = jnn.relu,
         initial_final_activation: Callable[[Array], Array] = lambda x: x,
         output_activation: Callable[[Array], Array] = jnn.relu,
-        output_final_activation: Callable[[Array], Array] = jnn.relu,
+        output_final_activation: Callable[[Array], Array] = lambda x: x,
     ) -> None:
         self.max_steps = max_steps
 
@@ -468,29 +468,170 @@ class NeuralCDE(eqx.Module):
 
 
 if __name__ == "__main__":
+    from typing import Any
+    import jax.scipy as jsp
+    import numpy as np
+    import optax
+    from matplotlib import pyplot as plt
+    from jax import lax
 
-    class Temp(eqx.Module):
-        ncde: NeuralCDE
+    def random_matrix(n: int, min_eig: float, max_eig: float, *, key: Any) -> Any:
+        key, eig_key, matrix_key = jr.split(key, 3)
+        eigvals = jr.uniform(eig_key, (n,), minval=min_eig, maxval=max_eig)
+        rand_mat = jr.normal(matrix_key, (n, n))
+        Q, R = jnp.linalg.qr(rand_mat)
+        diag = jnp.sign(jnp.diag(R))
+        Q = Q * diag
+        A = Q @ jnp.diag(eigvals) @ Q.T
+        return A
 
-        def __init__(self, key: Key):
-            self.ncde = NeuralCDE(1, 1, 1, 1, 1, 4, key=key)
+    def get_data(
+        n: int,
+        length: int,
+        t0: float,
+        t1: float,
+        *,
+        add_noise: bool = True,
+        noise_scale: float = 1e-3,
+        key: Any,
+    ):
+        initial_key, matrix_key, noise_key = jr.split(key, 3)
+        ts = jnp.linspace(t0, t1, length)
+        x0 = jr.uniform(initial_key, (n,))
+        matrix = random_matrix(n, -1, 1e-1, key=matrix_key)
+        xs = jax.vmap(lambda t: jsp.linalg.expm(t * matrix) @ x0)(ts)
+        if add_noise:
+            xs = xs + jr.normal(noise_key, xs.shape) * noise_scale
+        y1 = jnp.diag(matrix)
+        return xs, ts, y1
 
-        def __getattr__(self, name):
-            return getattr(self.ncde, name)
+    def simulate_trajectory(neural_cde, ts, xs, init_state):
+        def scan_fn(carry, inputs):
+            t, x = inputs
+            y, new_state = neural_cde(t, x, carry)
+            return new_state, y
 
-        def __call__(self, *args, **kwargs):
-            return self.ncde(*args, **kwargs)
+        final_state, _ = lax.scan(scan_fn, init_state, (ts, xs))
+        y_pred = neural_cde.y1(final_state)
+        return y_pred
 
-        def x1(self, *args, **kwargs):
-            return self.ncde.x1(*args, **kwargs)
+    @eqx.filter_jit
+    @eqx.filter_value_and_grad
+    def loss_grad(neural_cde, state, xs_batch, ts_batch, y_batch):
+        init_state = neural_cde.empty_state(state)
+        y_preds = jax.vmap(
+            lambda ts, xs: simulate_trajectory(neural_cde, ts, xs, init_state)
+        )(ts_batch, xs_batch)
+        return jnp.mean((y_preds - y_batch) ** 2)
 
-    key = jr.key(0)
-    ncde, state = eqx.nn.make_with_state(Temp)(key)
+    dataset_size = 128
+    data_length = 128
+    data_time = 4 * jnp.pi
+    add_noise = True
+    data_dim = 2
+    learning_rate = 1e-4
+    epochs = 128
+    batch_size = 16
+    seed = 0
 
-    def new(i):
-        return ncde(jnp.array(0.0), jnp.array([i]), state)[1]
+    key = jr.key(seed)
+    key, data_key, model_key = jr.split(key, 3)
 
-    states = jax.vmap(new)(jnp.arange(10))
+    xs, ts, y1 = jax.vmap(
+        lambda key, t0: get_data(
+            data_dim,
+            data_length,
+            t0=t0,
+            t1=t0 + data_time,
+            add_noise=add_noise,
+            key=key,
+        )
+    )(jr.split(data_key, dataset_size), jnp.linspace(0, 1, dataset_size))
 
-    print(states)
-    print(jax.vmap(ncde.x1)(states))
+    neural_cde, state = eqx.nn.make_with_state(NeuralCDE)(
+        input_size=data_dim,
+        state_size=2,
+        output_size=data_dim,
+        width_size=64,
+        depth=2,
+        max_steps=data_length,
+        field_activation=jnn.relu,
+        key=model_key,
+    )
+    schedule = optax.cosine_decay_schedule(
+        learning_rate, decay_steps=(dataset_size // batch_size) * epochs
+    )
+    optimizer = optax.adam(schedule)
+    opt_state = optimizer.init(eqx.filter(neural_cde, eqx.is_array))
+
+    num_batches = dataset_size // batch_size
+    model_dynamic, model_static = eqx.partition(neural_cde, eqx.is_inexact_array)
+
+    def batch_scan(carry, inputs):
+        model_dynamic, opt_state, model_state = carry
+        model = eqx.combine(model_dynamic, model_static)
+        xs_batch, ts_batch, y_batch = inputs
+        loss, grads = loss_grad(model, model_state, xs_batch, ts_batch, y_batch)
+        updates, opt_state = optimizer.update(grads, opt_state)
+        model = eqx.apply_updates(model, updates)
+        model_dynamic, _ = eqx.partition(model, eqx.is_inexact_array)
+        return (model_dynamic, opt_state, model_state), loss
+
+    def epoch_scan(carry, epoch_idx):
+        key, model_dynamic, opt_state, model_state = carry
+        key, subkey = jr.split(key)
+        perm = jr.permutation(subkey, dataset_size)
+        indices = perm.reshape(num_batches, -1)
+        (model_dynamic, opt_state, model_state), epoch_losses = jax.lax.scan(
+            batch_scan,
+            (model_dynamic, opt_state, model_state),
+            (xs[indices], ts[indices], y1[indices]),
+        )
+        epoch_loss = jnp.mean(epoch_losses)
+        jax.debug.print("Epoch {:03}: loss={:.5f}", epoch_idx, epoch_loss, ordered=True)
+        return (key, model_dynamic, opt_state, model_state), epoch_loss
+
+    init_carry = (key, model_dynamic, opt_state, state)
+    (final_key, final_model_dynamic, final_opt_state, final_state), epoch_losses = (
+        lax.scan(epoch_scan, init_carry, jnp.arange(epochs))
+    )
+    print(f"Final training loss: {epoch_losses[-1]:.5f}")
+
+    test_key = jr.split(final_key)[0]
+    t0_test = 0.0
+    t1_test = t0_test + data_time
+    test_xs, test_ts, test_y1 = get_data(
+        data_dim,
+        data_length,
+        t0=t0_test,
+        t1=t1_test,
+        add_noise=False,
+        key=test_key,
+    )
+    test_loss, _ = loss_grad(
+        eqx.combine(final_model_dynamic, model_static),
+        final_state,
+        test_xs[None, ...],
+        test_ts[None, ...],
+        test_y1[None, ...],
+    )
+    print(f"Test loss: {test_loss:.5f}")
+
+    test_zs = neural_cde.states_from_sequence(test_ts, test_xs, save_all=True)
+    test_ys = jax.vmap(neural_cde.output_network)(test_zs)
+
+    test_zs = np.array(test_zs)
+    test_ys = np.array(test_ys)
+    test_y1 = np.array(test_y1)
+
+    plt.figure()
+    plt.plot(test_zs[:, 0], test_zs[:, 1], label="Hidden State Trajectory")
+    plt.plot(test_ys[:, 0], test_ys[:, 1], "--", label="Output Trajectory")
+    plt.scatter(
+        test_y1[0], test_y1[1], color="red", marker="o", s=100, label="Target Y"
+    )
+    plt.xlabel("Dimension 0")
+    plt.ylabel("Dimension 1")
+    plt.title("State-space Trajectories and Target Y")
+    plt.legend()
+    plt.show()

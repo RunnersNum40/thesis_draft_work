@@ -1,9 +1,10 @@
 import equinox as eqx
 from jax import random as jr
+from jax import nn as jnn
 
 import gymnax
 from ppo import PPO
-from policies import SharedNeuralCDEActorCriticPolicy
+from policies import CDEActorMLPCriticPolicy
 import wrappers
 
 
@@ -16,8 +17,8 @@ def main():
     env = wrappers.RescaleAction(env)
     env = wrappers.AddTimeWrapper(env)
 
-    learning_rate = 1e-4
-    num_steps = 2048
+    learning_rate = 3e-4
+    num_steps = 1024
     num_epochs = 8
     num_minibatches = 32
     total_timesteps = 1048576
@@ -26,13 +27,12 @@ def main():
     depth = 2
 
     ppo_agent, state = eqx.nn.make_with_state(PPO)(
-        policy_class=SharedNeuralCDEActorCriticPolicy,
+        policy_class=CDEActorMLPCriticPolicy,
         policy_args=(),
         policy_kwargs={
             "width_size": width_size,
             "depth": depth,
             "state_size": 4,
-            "num_features": 4,
             "max_steps": 4,
         },
         env=env,
@@ -41,6 +41,8 @@ def main():
         anneal_learning_rate=True,
         num_steps=num_steps,
         num_epochs=num_epochs,
+        state_coefficient=0.1,
+        max_gradient_norm=1.0,
         num_minibatches=num_minibatches,
         key=key,
     )
@@ -48,7 +50,7 @@ def main():
     state = ppo_agent.learn(
         state,
         total_timesteps=total_timesteps,
-        # tb_log_name=f"{env_id}_ncde_heun",
+        tb_log_name=f"{env_id}_mlp_critic",
         key=key,
         progress_bar=True,
     )

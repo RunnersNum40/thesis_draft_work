@@ -14,13 +14,16 @@ from jaxtyping import Array, Float, Int, Key, PyTree
 from stateful_ncde import NeuralCDE
 from wrappers import Env
 
+TFeatures = TypeVar("TFeatures", bound=PyTree[Array])
 TAction = TypeVar("TAction", bound=PyTree[Array])
 TObservation = TypeVar("TObservation", bound=PyTree[Array])
 TActionSpace = TypeVar("TActionSpace", bound=spaces.Space)
 TObservationSpace = TypeVar("TObservationSpace", bound=spaces.Space)
 
 
-class AbstractActorCriticPolicy[TObservation, TAction, TActionSpace, TObservationSpace](
+class AbstractActorCriticPolicy[
+    TFeatures, TObservation, TAction, TActionSpace, TObservationSpace
+](
     eqx.Module,
     strict=True,
 ):
@@ -35,19 +38,19 @@ class AbstractActorCriticPolicy[TObservation, TAction, TActionSpace, TObservatio
     @abstractmethod
     def extract_features(
         self, observation: TObservation, state: eqx.nn.State
-    ) -> tuple[Array, eqx.nn.State]:
+    ) -> tuple[TFeatures, eqx.nn.State]:
         """Compute a set of features from the observation."""
         raise NotImplementedError
 
     @abstractmethod
     def value_from_features(
-        self, features: Array, state: eqx.nn.State
+        self, features: TFeatures, state: eqx.nn.State
     ) -> tuple[Array, eqx.nn.State]:
         raise NotImplementedError
 
     @abstractmethod
     def action_dist_from_features(
-        self, features: Array, state
+        self, features: TFeatures, state
     ) -> tuple[distributions.AbstractDistribution, eqx.nn.State]:
         raise NotImplementedError
 
@@ -153,9 +156,13 @@ def flatten_sample(
     raise ValueError(f"Cannot flatten {space}.")
 
 
-class MLPActorCriticPolicy(
+class MLPActorMLPCriticPolicy(
     AbstractActorCriticPolicy[
-        Float[Array, "..."], PyTree[Array], spaces.Box | spaces.Discrete, spaces.Space
+        Float[Array, " n"],
+        Float[Array, "..."],
+        PyTree[Array],
+        spaces.Box | spaces.Discrete,
+        spaces.Space,
     ],
     strict=True,
 ):
@@ -266,16 +273,13 @@ class MLPActorCriticPolicy(
         return state.get(self.state_index)
 
 
-def clone_state(state: eqx.nn.State) -> eqx.nn.State:
-    """Clone the state."""
-    leaves, treedef = jax.tree.flatten(state)
-    state_clone = jax.tree.unflatten(treedef, leaves)
-    return state_clone
-
-
-class SharedNeuralCDEActorCriticPolicy(
+class SharedCDEPolicy(
     AbstractActorCriticPolicy[
-        Float[Array, "..."], PyTree[Array], spaces.Box | spaces.Discrete, spaces.Dict
+        Float[Array, " n"],
+        Float[Array, "..."],
+        PyTree[Array],
+        spaces.Box | spaces.Discrete,
+        spaces.Dict,
     ],
     strict=True,
 ):
@@ -305,7 +309,7 @@ class SharedNeuralCDEActorCriticPolicy(
         field_width_size: int | None = None,
         field_depth: int | None = None,
         field_activation: Callable[[Array], Array] = jnn.relu,
-        field_output_activation: Callable[[Array], Array] = lambda x: x,
+        field_final_activation: Callable[[Array], Array] = jnn.tanh,
         output_width_size: int | None = None,
         output_depth: int | None = None,
         output_activation: Callable[[Array], Array] = jnn.relu,
@@ -344,7 +348,7 @@ class SharedNeuralCDEActorCriticPolicy(
             output_width_size=output_width_size,
             output_depth=output_depth,
             field_activation=field_activation,
-            field_final_activation=field_output_activation,
+            field_final_activation=field_final_activation,
             initial_activation=initial_activation,
             initial_final_activation=inital_final_activation,
             output_activation=output_activation,
@@ -390,7 +394,7 @@ class SharedNeuralCDEActorCriticPolicy(
             observation["observation"], self.observation_space.spaces["observation"]
         )
 
-        features, state = self.ncde(time, flattened, clone_state(state))
+        features, state = self.ncde(time, flattened, state)
         return features, state
 
     def value_from_features(
@@ -425,17 +429,315 @@ class SharedNeuralCDEActorCriticPolicy(
         self, env_state: gym.EnvState, env_params: gym.EnvParams, state: eqx.nn.State
     ) -> eqx.nn.State:
         """Reset the policy state."""
-        return self.ncde.empty_state(clone_state(state))
+        return self.ncde.empty_state(state)
 
     def get_hidden_state(self, state: eqx.nn.State) -> Float[Array, " state_size"]:
         return self.ncde.z1(state)
+
+
+class CDEActorCDECriticPolicy(
+    AbstractActorCriticPolicy[
+        tuple[Float[Array, ""], Float[Array, " n"]],
+        Float[Array, "..."],
+        PyTree[Array],
+        spaces.Box | spaces.Discrete,
+        spaces.Dict,
+    ],
+    strict=True,
+):
+    observation_space: spaces.Dict
+    action_space: spaces.Box | spaces.Discrete
+
+    actor: NeuralCDE
+    action_logstd: Float[Array, " ..."] | None
+    critic: NeuralCDE
+
+    def __init__(
+        self,
+        env: Env,
+        env_params: gym.EnvParams,
+        width_size: int,
+        depth: int,
+        state_size: int,
+        max_steps: int,
+        *,
+        initial_width_size: int | None = None,
+        initial_depth: int | None = None,
+        initial_activation: Callable[[Array], Array] = jnn.relu,
+        inital_final_activation: Callable[[Array], Array] = lambda x: x,
+        field_width_size: int | None = None,
+        field_depth: int | None = None,
+        field_activation: Callable[[Array], Array] = jnn.relu,
+        field_final_activation: Callable[[Array], Array] = jnn.tanh,
+        output_width_size: int | None = None,
+        output_depth: int | None = None,
+        output_activation: Callable[[Array], Array] = jnn.relu,
+        output_final_activation: Callable[[Array], Array] = lambda x: x,
+        key: Key,
+    ):
+        self.observation_space = env.observation_space(env_params)
+        self.action_space = env.action_space(env_params)
+
+        assert isinstance(self.observation_space, spaces.Dict)
+        assert "time" in self.observation_space.spaces
+        assert "observation" in self.observation_space.spaces
+        assert len(self.observation_space.spaces) == 2
+
+        actor_key, critic_key = jr.split(key, 2)
+
+        self.actor = NeuralCDE(
+            input_size=space_size(self.observation_space.spaces["observation"]),
+            state_size=state_size,
+            output_size=space_size(self.action_space),
+            width_size=width_size,
+            depth=depth,
+            max_steps=max_steps,
+            initial_width_size=initial_width_size,
+            initial_depth=initial_depth,
+            field_width_size=field_width_size,
+            field_depth=field_depth,
+            output_width_size=output_width_size,
+            output_depth=output_depth,
+            field_activation=field_activation,
+            field_final_activation=field_final_activation,
+            initial_activation=initial_activation,
+            initial_final_activation=inital_final_activation,
+            output_activation=output_activation,
+            output_final_activation=output_final_activation,
+            key=actor_key,
+        )
+
+        if isinstance(self.action_space, spaces.Discrete):
+            self.action_logstd = None
+        elif isinstance(self.action_space, spaces.Box):
+            self.action_logstd = jnp.zeros(space_size(self.action_space))
+        else:
+            raise ValueError(
+                f"Cannot create actor for action space {self.action_space}. Only Discrete and Box supported."
+            )
+
+        self.critic = NeuralCDE(
+            input_size=space_size(self.observation_space.spaces["observation"]),
+            state_size=state_size,
+            output_size="scalar",
+            width_size=width_size,
+            depth=depth,
+            max_steps=max_steps,
+            initial_width_size=initial_width_size,
+            initial_depth=initial_depth,
+            field_width_size=field_width_size,
+            field_depth=field_depth,
+            output_width_size=output_width_size,
+            output_depth=output_depth,
+            field_activation=field_activation,
+            field_final_activation=field_final_activation,
+            initial_activation=initial_activation,
+            initial_final_activation=inital_final_activation,
+            output_activation=output_activation,
+            output_final_activation=output_final_activation,
+            key=critic_key,
+        )
+
+    def extract_features(
+        self, observation: PyTree[Array], state: eqx.nn.State
+    ) -> tuple[tuple[Float[Array, ""], Float[Array, " n"]], eqx.nn.State]:
+        """Extract features from the observation."""
+        time = observation["time"]
+        flattened = flatten_sample(
+            observation["observation"], self.observation_space.spaces["observation"]
+        )
+
+        return (time, flattened), state
+
+    def value_from_features(
+        self, features: tuple[Float[Array, ""], Float[Array, " n"]], state: eqx.nn.State
+    ) -> tuple[Float[Array, ""], eqx.nn.State]:
+        """Get the value from the features."""
+        value, state = self.critic(*features, state)
+        return value, state
+
+    def action_dist_from_features(
+        self, features: tuple[Float[Array, ""], Float[Array, " n"]], state: eqx.nn.State
+    ) -> tuple[distributions.AbstractDistribution, eqx.nn.State]:
+        """Get the action distribution from the features.
+
+        Returns a Categorical distribution for discrete actions and a Normal
+        distribution for continuous actions.
+        """
+        if isinstance(self.action_space, spaces.Discrete):
+            logits, state = self.actor(*features, state)
+            action_dist = distributions.Categorical(logits=logits)
+        elif isinstance(self.action_space, spaces.Box):
+            assert self.action_logstd is not None
+            mean, state = self.actor(*features, state)
+            std = jnp.exp(self.action_logstd)
+            action_dist = distributions.Normal(loc=mean, scale=std)
+        else:
+            raise ValueError(f"Action space {self.action_space} is not supported.")
+
+        return action_dist, state
+
+    def reset(
+        self, env_state: gym.EnvState, env_params: gym.EnvParams, state: eqx.nn.State
+    ) -> eqx.nn.State:
+        """Reset the policy state."""
+        state = self.actor.empty_state(state)
+        state = self.critic.empty_state(state)
+        return state
+
+    def get_hidden_state(self, state: eqx.nn.State) -> Float[Array, " state_size"]:
+        return jnp.concatenate([self.actor.z1(state), self.critic.z1(state)])
+
+
+class CDEActorMLPCriticPolicy(
+    AbstractActorCriticPolicy[
+        tuple[Float[Array, ""], Float[Array, " n"]],
+        Float[Array, "..."],
+        PyTree[Array],
+        spaces.Box | spaces.Discrete,
+        spaces.Dict,
+    ],
+    strict=True,
+):
+    observation_space: spaces.Dict
+    action_space: spaces.Box | spaces.Discrete
+
+    actor: NeuralCDE
+    action_logstd: Float[Array, " ..."] | None
+    critic: eqx.nn.MLP
+
+    def __init__(
+        self,
+        env: Env,
+        env_params: gym.EnvParams,
+        width_size: int,
+        depth: int,
+        state_size: int,
+        max_steps: int,
+        *,
+        initial_width_size: int | None = None,
+        initial_depth: int | None = None,
+        initial_activation: Callable[[Array], Array] = jnn.relu,
+        inital_final_activation: Callable[[Array], Array] = lambda x: x,
+        field_width_size: int | None = None,
+        field_depth: int | None = None,
+        field_activation: Callable[[Array], Array] = jnn.relu,
+        field_final_activation: Callable[[Array], Array] = jnn.tanh,
+        output_width_size: int | None = None,
+        output_depth: int | None = None,
+        output_activation: Callable[[Array], Array] = jnn.relu,
+        output_final_activation: Callable[[Array], Array] = lambda x: x,
+        critic_width_size: int | None = None,
+        critic_depth: int | None = None,
+        critic_activation: Callable[[Array], Array] = jnn.relu,
+        critic_final_activation: Callable[[Array], Array] = lambda x: x,
+        key: Key,
+    ):
+        self.observation_space = env.observation_space(env_params)
+        self.action_space = env.action_space(env_params)
+
+        assert isinstance(self.observation_space, spaces.Dict)
+        assert "time" in self.observation_space.spaces
+        assert "observation" in self.observation_space.spaces
+        assert len(self.observation_space.spaces) == 2
+
+        actor_key, critic_key = jr.split(key, 2)
+
+        self.actor = NeuralCDE(
+            input_size=space_size(self.observation_space.spaces["observation"]),
+            state_size=state_size,
+            output_size=space_size(self.action_space),
+            width_size=width_size,
+            depth=depth,
+            max_steps=max_steps,
+            initial_width_size=initial_width_size,
+            initial_depth=initial_depth,
+            field_width_size=field_width_size,
+            field_depth=field_depth,
+            output_width_size=output_width_size,
+            output_depth=output_depth,
+            field_activation=field_activation,
+            field_final_activation=field_final_activation,
+            initial_activation=initial_activation,
+            initial_final_activation=inital_final_activation,
+            output_activation=output_activation,
+            output_final_activation=output_final_activation,
+            key=actor_key,
+        )
+
+        if isinstance(self.action_space, spaces.Discrete):
+            self.action_logstd = None
+        elif isinstance(self.action_space, spaces.Box):
+            self.action_logstd = jnp.zeros(space_size(self.action_space))
+        else:
+            raise ValueError(
+                f"Cannot create actor for action space {self.action_space}. Only Discrete and Box supported."
+            )
+
+        self.critic = eqx.nn.MLP(
+            in_size=space_size(self.observation_space.spaces["observation"]),
+            out_size="scalar",
+            width_size=critic_width_size if critic_width_size else width_size,
+            depth=critic_depth if critic_depth else depth,
+            activation=critic_activation,
+            final_activation=critic_final_activation,
+            key=critic_key,
+        )
+
+    def extract_features(
+        self, observation: PyTree[Array], state: eqx.nn.State
+    ) -> tuple[tuple[Float[Array, ""], Float[Array, " n"]], eqx.nn.State]:
+        """Extract features from the observation."""
+        time = observation["time"]
+        flattened = flatten_sample(
+            observation["observation"], self.observation_space.spaces["observation"]
+        )
+
+        return (time, flattened), state
+
+    def value_from_features(
+        self, features: tuple[Float[Array, ""], Float[Array, " n"]], state: eqx.nn.State
+    ) -> tuple[Float[Array, ""], eqx.nn.State]:
+        """Get the value from the features."""
+        value = self.critic(features[1])
+        return value, state
+
+    def action_dist_from_features(
+        self, features: tuple[Float[Array, ""], Float[Array, " n"]], state: eqx.nn.State
+    ) -> tuple[distributions.AbstractDistribution, eqx.nn.State]:
+        """Get the action distribution from the features.
+
+        Returns a Categorical distribution for discrete actions and a Normal
+        distribution for continuous actions.
+        """
+        if isinstance(self.action_space, spaces.Discrete):
+            logits, state = self.actor(*features, state)
+            action_dist = distributions.Categorical(logits=logits)
+        elif isinstance(self.action_space, spaces.Box):
+            assert self.action_logstd is not None
+            mean, state = self.actor(*features, state)
+            std = jnp.exp(self.action_logstd)
+            action_dist = distributions.Normal(loc=mean, scale=std)
+        else:
+            raise ValueError(f"Action space {self.action_space} is not supported.")
+
+        return action_dist, state
+
+    def reset(
+        self, env_state: gym.EnvState, env_params: gym.EnvParams, state: eqx.nn.State
+    ) -> eqx.nn.State:
+        """Reset the policy state."""
+        return self.actor.empty_state(state)
+
+    def get_hidden_state(self, state: eqx.nn.State) -> Float[Array, " state_size"]:
+        return self.actor.z1(state)
 
 
 if __name__ == "__main__":
     key = jr.key(0)
     env, env_params = gym.make("Pendulum-v1")
 
-    policy, state = eqx.nn.make_with_state(MLPActorCriticPolicy)(
+    policy, state = eqx.nn.make_with_state(MLPActorMLPCriticPolicy)(
         env,
         env_params,
         width_size=64,
