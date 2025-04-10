@@ -99,7 +99,7 @@ class MaskObservationWrapper(TransformObservationWrapper[TEnvState, TEnvParams])
             return spaces.Box(
                 low=low,
                 high=high,
-                shape=mask.shape,
+                shape=low.shape,
             )
 
         super().__init__(env, mask_observation, mask_observation_space)
